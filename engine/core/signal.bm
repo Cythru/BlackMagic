@@ -1,0 +1,162 @@
+/// BlackMagic Engine — core/signal.bm
+///
+/// Godot-style signal system: type-safe emit/connect with callable slots.
+/// Supports: one-shot, deferred (queued for end-of-frame), and immediate dispatch.
+///
+/// Architecture:
+///   Signal<T>       — owned signal, stores list of Callable<T>
+///   Callable<T>     — a fn pointer that accepts T
+///   SignalBus       — global deferred-emit queue (processed each frame)
+///   #[signal]       — attribute syntax sugar (comptime macro expansion)
+
+use bm::collections::{ Vec as BmVec };
+
+// ─── Callable ──────────────────────────────────────────────────────────────
+
+/// A callable that accepts one argument of type T.
+/// BM does not have closures; wraps plain fn pointers.
+pub struct Callable<T> {
+    fn_ptr:   fn(T),
+    one_shot: bool,
+}
+
+impl<T> Callable<T> {
+    /// Create from a plain function pointer.
+    pub fn from_fn(f: fn(T)) -> Callable<T> {
+        Callable { fn_ptr: f, one_shot: false }
+    }
+
+    /// Create a one-shot callable — removed after first call.
+    pub fn once(f: fn(T)) -> Callable<T> {
+        Callable { fn_ptr: f, one_shot: true }
+    }
+
+    #[inline]
+    pub fn call(self, arg: T) {
+        (self.fn_ptr)(arg);
+    }
+}
+
+// ─── Signal<T> ─────────────────────────────────────────────────────────────
+
+/// Owns a list of callables and dispatches to them when emitted.
+pub struct Signal<T> {
+    slots: BmVec<Callable<T>>,
+}
+
+impl<T> Signal<T> {
+    pub fn new() -> Signal<T> {
+        Signal { slots: BmVec::new() }
+    }
+
+    /// Connect a callable. Returns connection index.
+    pub fn connect(self: &var Signal<T>, slot: Callable<T>) -> usize {
+        let idx = self.slots.len();
+        self.slots.push(slot);
+        idx
+    }
+
+    /// Connect a plain fn pointer.
+    pub fn connect_fn(self: &var Signal<T>, f: fn(T)) -> usize {
+        self.connect(Callable::from_fn(f))
+    }
+
+    /// Disconnect by index (swap-removes for O(1)).
+    pub fn disconnect(self: &var Signal<T>, idx: usize) {
+        if idx < self.slots.len() {
+            self.slots.swap_remove(idx);
+        }
+    }
+
+    /// Disconnect all slots.
+    pub fn disconnect_all(self: &var Signal<T>) {
+        self.slots.clear();
+    }
+
+    /// Emit: call all connected callables immediately.
+    /// One-shot slots are removed after calling.
+    #[sicko]
+    pub fn emit(self: &var Signal<T>, arg: T) {
+        var i: usize = 0;
+        while i < self.slots.len() {
+            let slot = self.slots[i];
+            slot.call(arg);
+            if slot.one_shot {
+                self.slots.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    pub fn connection_count(self: &Signal<T>) -> usize {
+        self.slots.len()
+    }
+}
+
+// ─── SignalBus ─────────────────────────────────────────────────────────────
+//
+// A per-scene deferred-emit queue. Call `SignalBus::flush()` at end-of-frame.
+// Deferred emits are used from physics callbacks or subthreads to avoid
+// re-entrant mutation.
+
+pub struct DeferredEvent {
+    emit_fn:  fn(*var ()),   // closed-over emit + arg
+    ctx:      *var (),
+}
+
+pub struct SignalBus {
+    queue: BmVec<DeferredEvent>,
+}
+
+impl SignalBus {
+    pub fn new() -> SignalBus {
+        SignalBus { queue: BmVec::new() }
+    }
+
+    /// Enqueue a deferred emit. Caller provides a heap-allocated closure.
+    pub fn enqueue(self: &var SignalBus, ev: DeferredEvent) {
+        self.queue.push(ev);
+    }
+
+    /// Flush all queued events. Call once per frame (end of update).
+    pub fn flush(self: &var SignalBus) {
+        var i: usize = 0;
+        while i < self.queue.len() {
+            let ev = self.queue[i];
+            (ev.emit_fn)(ev.ctx);
+            i += 1;
+        }
+        self.queue.clear();
+    }
+
+    pub fn pending_count(self: &SignalBus) -> usize {
+        self.queue.len()
+    }
+}
+
+// ─── Common signal arg types ──────────────────────────────────────────────
+
+/// Emitted when a node enters the scene tree.
+pub struct SigEnterTree {}
+
+/// Emitted when a node exits the scene tree.
+pub struct SigExitTree {}
+
+/// Emitted once per frame with the delta time (seconds).
+pub struct SigProcess   { pub delta: f32 }
+
+/// Emitted once per physics frame with fixed delta.
+pub struct SigPhysTick  { pub delta: f32 }
+
+/// Emitted when a node's name/path changes.
+pub struct SigRenamed   { pub old_name: str, pub new_name: str }
+
+/// Emitted by Button/UI nodes when pressed.
+pub struct SigPressed   {}
+
+/// Emitted by UI nodes when value changes (slider, spin-box, etc.).
+pub struct SigValueChanged { pub value: f32 }
+
+/// Generic typed payload for game-level signals.
+pub struct SigGameEvent { pub id: u32, pub data: u64 }

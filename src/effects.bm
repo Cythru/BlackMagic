@@ -1,0 +1,255 @@
+/// BlackMagic Effect Checker
+/// Verifies:
+///   - Every effect used in a function body is declared in its signature
+///   - `handle ... with` blocks properly handle effect operations
+///   - `resume` only appears inside an effect handler
+
+use std::collections::{HashMap, HashSet};
+use crate::ast::*;
+use crate::error::{BmError, Span};
+
+// ─── Effect signature registry ────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct EffectSignature {
+    pub name: String,
+    pub ops:  Vec<String>,
+}
+
+// ─── Effect Checker ────────────────────────────────────────────────────────
+
+pub struct EffectChecker {
+    pub errors:   Vec<BmError>,
+    pub warnings: Vec<BmError>,
+    known:        HashMap<String, EffectSignature>,
+    handled:      Vec<HashSet<String>>,
+    in_handler:   bool,
+}
+
+impl EffectChecker {
+    pub fn new() -> Self {
+        EffectChecker {
+            errors:     Vec::new(),
+            warnings:   Vec::new(),
+            known:      HashMap::new(),
+            handled:    Vec::new(),
+            in_handler: false,
+        }
+    }
+
+    pub fn check_file(&mut self, file: &SourceFile) {
+        // Pass 1: register all effect declarations
+        for item in &file.items {
+            if let ItemKind::Effect(e) = &item.kind {
+                let sig = EffectSignature {
+                    name: e.name.name.clone(),
+                    ops:  e.ops.iter().map(|op| op.name.name.clone()).collect(),
+                };
+                self.known.insert(e.name.name.clone(), sig);
+            }
+        }
+        // Pass 2: check functions
+        for item in &file.items { self.check_item(item); }
+    }
+
+    fn check_item(&mut self, item: &Item) {
+        match &item.kind {
+            ItemKind::Function(f)  => self.check_function(f),
+            ItemKind::Impl(im)     => {
+                for it in &im.items {
+                    if let ItemKind::Function(f) = &it.kind { self.check_function(f); }
+                }
+            }
+            ItemKind::Module(m)    => {
+                for it in &m.items { self.check_item(it); }
+            }
+            _ => {}
+        }
+    }
+
+    fn check_function(&mut self, f: &FunctionDecl) {
+        let sig_effects: HashSet<String> = f.effects
+            .iter()
+            .map(|e| e.path.segments.last().unwrap().name.clone())
+            .collect();
+
+        let prev_in_handler = self.in_handler;
+        self.in_handler = false;
+
+        let mut used = HashSet::new();
+        if let Some(body) = &f.body {
+            self.check_block(body, &sig_effects, &mut used);
+        }
+
+        // Warn on declared-but-unused effects
+        for eff in &sig_effects {
+            if !used.contains(eff) {
+                self.warnings.push(BmError::EffectError {
+                    msg: format!(
+                        "function `{}` declares effect `{}` but never uses it",
+                        f.name.name, eff
+                    ),
+                    span: f.name.span,
+                });
+            }
+        }
+
+        self.in_handler = prev_in_handler;
+    }
+
+    fn check_block(&mut self, block: &Block, allowed: &HashSet<String>, used: &mut HashSet<String>) {
+        for stmt in &block.stmts {
+            self.check_stmt(stmt, allowed, used);
+        }
+        if let Some(tail) = &block.expr {
+            self.check_expr(tail, allowed, used);
+        }
+    }
+
+    fn check_stmt(&mut self, stmt: &Stmt, allowed: &HashSet<String>, used: &mut HashSet<String>) {
+        match &stmt.kind {
+            StmtKind::Let { init, .. } => {
+                if let Some(v) = init { self.check_expr(v, allowed, used); }
+            }
+            StmtKind::Expr(e) => self.check_expr(e, allowed, used),
+            StmtKind::Const { init, .. } => {
+                self.check_expr(init, allowed, used);
+            }
+            StmtKind::Item(_) => {}
+        }
+    }
+
+    fn check_expr(&mut self, expr: &Expr, allowed: &HashSet<String>, used: &mut HashSet<String>) {
+        match &expr.kind {
+            ExprKind::Call { callee, args } => {
+                // Detect `EffectName::op(...)` calls — these are effect performs
+                if let ExprKind::Var(path) = &callee.kind {
+                    if path.segments.len() >= 2 {
+                        let eff_name = path.segments[path.segments.len() - 2].name.clone();
+                        if self.known.contains_key(&eff_name) {
+                            used.insert(eff_name.clone());
+                            if !allowed.contains(&eff_name) && !self.is_handled(&eff_name) {
+                                self.errors.push(BmError::EffectError {
+                                    msg: format!(
+                                        "effect `{}` is performed but not declared or handled",
+                                        eff_name
+                                    ),
+                                    span: expr.span,
+                                });
+                            }
+                        }
+                    }
+                }
+                self.check_expr(callee, allowed, used);
+                for a in args { self.check_expr(&a.expr, allowed, used); }
+            }
+            ExprKind::Handle { computation, handlers } => {
+                // Collect handled effects
+                let handled_set: HashSet<String> = handlers.iter()
+                    .filter_map(|h| {
+                        if h.effect_op.segments.len() >= 2 {
+                            Some(h.effect_op.segments[h.effect_op.segments.len() - 2].name.clone())
+                        } else if h.effect_op.segments.len() == 1 {
+                            Some(h.effect_op.segments[0].name.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                self.handled.push(handled_set);
+                let prev = self.in_handler;
+                self.in_handler = true;
+                self.check_expr(computation, allowed, used);
+                for h in handlers {
+                    let mut handler_used = HashSet::new();
+                    self.check_block(&h.body, allowed, &mut handler_used);
+                    used.extend(handler_used);
+                }
+                self.in_handler = prev;
+                self.handled.pop();
+            }
+            ExprKind::Resume(inner) => {
+                if !self.in_handler {
+                    self.errors.push(BmError::EffectError {
+                        msg: "`resume` used outside of an effect handler".to_string(),
+                        span: expr.span,
+                    });
+                }
+                self.check_expr(inner, allowed, used);
+            }
+            ExprKind::Block(b)  => self.check_block(b, allowed, used),
+            ExprKind::Unsafe(b) => self.check_block(b, allowed, used),
+            ExprKind::If { cond, then, else_ } => {
+                self.check_expr(cond, allowed, used);
+                self.check_block(then, allowed, used);
+                if let Some(el) = else_ { self.check_expr(el, allowed, used); }
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                self.check_expr(scrutinee, allowed, used);
+                for arm in arms {
+                    if let Some(g) = &arm.guard { self.check_expr(g, allowed, used); }
+                    self.check_expr(&arm.body, allowed, used);
+                }
+            }
+            ExprKind::While { cond, body, .. } => {
+                self.check_expr(cond, allowed, used);
+                self.check_block(body, allowed, used);
+            }
+            ExprKind::For { iter, body, .. } => {
+                self.check_expr(iter, allowed, used);
+                self.check_block(body, allowed, used);
+            }
+            ExprKind::Closure { body, .. } => {
+                self.check_expr(body, allowed, used);
+            }
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.check_expr(lhs, allowed, used);
+                self.check_expr(rhs, allowed, used);
+            }
+            ExprKind::Unary { operand, .. } => { self.check_expr(operand, allowed, used); }
+            ExprKind::Return(e) => {
+                if let Some(e) = e { self.check_expr(e, allowed, used); }
+            }
+            ExprKind::Assign { target, value, .. } => {
+                self.check_expr(target, allowed, used);
+                self.check_expr(value, allowed, used);
+            }
+            ExprKind::Defer(e) | ExprKind::Try(e) | ExprKind::Await(e)
+            | ExprKind::Spawn(e) | ExprKind::Move(e) | ExprKind::Deref(e)
+            | ExprKind::Comptime(e) => {
+                self.check_expr(e, allowed, used);
+            }
+            ExprKind::Ref { expr: e, .. } => { self.check_expr(e, allowed, used); }
+            ExprKind::Cast { expr: e, .. } => { self.check_expr(e, allowed, used); }
+            ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => {
+                self.check_expr(base, allowed, used);
+            }
+            ExprKind::Index { base, idx } => {
+                self.check_expr(base, allowed, used);
+                self.check_expr(idx, allowed, used);
+            }
+            ExprKind::MethodCall { receiver, args, .. } => {
+                self.check_expr(receiver, allowed, used);
+                for a in args { self.check_expr(&a.expr, allowed, used); }
+            }
+            ExprKind::Tuple(es) => {
+                for e in es { self.check_expr(e, allowed, used); }
+            }
+            ExprKind::Array(ae) => {
+                match ae {
+                    ArrayExpr::List(es) => { for e in es { self.check_expr(e, allowed, used); } }
+                    ArrayExpr::Repeat { elem, count } => {
+                        self.check_expr(elem, allowed, used);
+                        self.check_expr(count, allowed, used);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn is_handled(&self, name: &str) -> bool {
+        self.handled.iter().any(|s| s.contains(name))
+    }
+}

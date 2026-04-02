@@ -1,0 +1,306 @@
+/// BlackMagic Engine — ai/scheduler.bm
+///
+/// VLLM-style continuous batching scheduler.
+/// Manages a pool of sequences across three queues: waiting, running, swapped.
+///
+/// Each scheduler tick (step()) selects sequences for prefill or decode,
+/// allocates KV blocks, and handles preemption when KV cache fills up.
+///
+/// Preemption policy: swap lowest-priority running sequence to CPU on OOM.
+
+use engine::ai::kvcache::{ BlockAllocator, BlockTable, KV_BLOCK_TOKENS, KV_NULL };
+use bm::mem::{ alloc_slice, free_slice };
+
+// ─── SeqState ─────────────────────────────────────────────────────────────────
+
+pub enum SeqState {
+    Waiting,    // in waiting queue, not yet started
+    Running,    // actively using KV cache, being decoded
+    Swapped,    // KV blocks copied to CPU, waiting for GPU space
+    Finished,   // generation complete
+}
+
+// ─── Sequence ─────────────────────────────────────────────────────────────────
+
+pub struct Sequence {
+    pub id:          u64,
+    pub tokens:      *var u32,     // all generated tokens (grows during decode)
+    pub len:         u32,          // current token count
+    pub max_len:     u32,          // max allowed tokens
+    pub prompt_len:  u32,          // input token count
+    pub block_table: BlockTable,
+    pub state:       SeqState,
+    pub priority:    u32,          // lower = higher priority
+    pub n_output:    u32,          // tokens generated so far
+}
+
+// ─── SchedulerOutput ─────────────────────────────────────────────────────────
+
+pub struct SchedulerOutput {
+    pub prefill_ids: *u64,   // sequence IDs to prefill this step
+    pub decode_ids:  *u64,   // sequence IDs to decode this step
+    pub n_prefill:   u32,
+    pub n_decode:    u32,
+}
+
+// ─── Scheduler ────────────────────────────────────────────────────────────────
+
+const MAX_SEQS: usize = 256;
+
+pub struct Scheduler {
+    seqs:        *var Sequence,
+    n_seqs:      u32,
+    seq_cap:     u32,
+
+    waiting:     [u32; 256],
+    n_waiting:   u32,
+
+    running:     [u32; 256],
+    n_running:   u32,
+
+    swapped:     [u32; 256],
+    n_swapped:   u32,
+
+    next_id:     u64,
+    max_batch:   u32,   // max sequences per decode batch
+}
+
+impl Scheduler {
+    pub fn new(max_seqs: u32, max_batch: u32) -> Scheduler {
+        var pool_sz = max_seqs as usize;
+        if pool_sz > MAX_SEQS { pool_sz = MAX_SEQS; }
+        let seqs = unsafe { alloc_slice::<Sequence>(pool_sz) };
+        Scheduler {
+            seqs,
+            n_seqs:    0,
+            seq_cap:   pool_sz as u32,
+            waiting:   [0u32; 256],
+            n_waiting: 0,
+            running:   [0u32; 256],
+            n_running: 0,
+            swapped:   [0u32; 256],
+            n_swapped: 0,
+            next_id:   1,
+            max_batch: if max_batch == 0 { 8 } else { max_batch },
+        }
+    }
+
+    /// Add a new request to the waiting queue.
+    pub fn add(self: &var Scheduler, prompt_tokens: *u32, n: u32, max_len: u32, priority: u32) -> u64 {
+        if self.n_seqs >= self.seq_cap { return 0; }
+        let id = self.next_id;
+        self.next_id += 1;
+        let idx = self.n_seqs;
+        self.n_seqs += 1;
+
+        let tok_buf = unsafe { alloc_slice::<u32>(max_len as usize) };
+        var i: u32 = 0;
+        while i < n {
+            unsafe { *tok_buf.add(i as usize) = *prompt_tokens.add(i as usize); }
+            i += 1;
+        }
+
+        let seq = Sequence {
+            id,
+            tokens:      tok_buf,
+            len:         n,
+            max_len,
+            prompt_len:  n,
+            block_table: BlockTable::new(1024),
+            state:       SeqState::Waiting,
+            priority,
+            n_output:    0,
+        };
+        unsafe { *self.seqs.add(idx as usize) = seq; }
+
+        if self.n_waiting < 256 {
+            self.waiting[self.n_waiting as usize] = idx;
+            self.n_waiting += 1;
+        }
+        id
+    }
+
+    /// One scheduler tick. Returns which sequences to prefill and decode.
+    /// Allocates KV blocks; preempts if pool is full.
+    pub fn step(self: &var Scheduler, pool: &var BlockAllocator) -> SchedulerOutput {
+        let pfill_buf = unsafe { alloc_slice::<u64>(self.n_waiting as usize + 1) };
+        let dec_buf   = unsafe { alloc_slice::<u64>(self.n_running as usize + 1) };
+        var n_pfill: u32 = 0;
+        var n_dec:   u32 = 0;
+
+        // Try to promote waiting → running (prefill up to max_batch)
+        var wi: u32 = 0;
+        while wi < self.n_waiting && self.n_running < self.max_batch {
+            let seq_idx = self.waiting[wi as usize];
+            let seq = unsafe { &var *self.seqs.add(seq_idx as usize) };
+            let blocks_needed = (seq.prompt_len + KV_BLOCK_TOKENS - 1) / KV_BLOCK_TOKENS;
+            var ok = true;
+            var b: u32 = 0;
+            while b < blocks_needed {
+                let blk = pool.alloc();
+                if blk == KV_NULL { ok = false; break; }
+                seq.block_table.push(blk);
+                b += 1;
+            }
+            if ok {
+                seq.state = SeqState::Running;
+                self.running[self.n_running as usize] = seq_idx;
+                self.n_running += 1;
+                unsafe { *pfill_buf.add(n_pfill as usize) = seq.id; }
+                n_pfill += 1;
+                // Remove from waiting
+                var wj = wi;
+                while wj + 1 < self.n_waiting {
+                    self.waiting[wj as usize] = self.waiting[(wj + 1) as usize];
+                    wj += 1;
+                }
+                self.n_waiting -= 1;
+                // Don't increment wi — slot was filled by shift
+            } else {
+                wi += 1;
+            }
+        }
+
+        // Decode all running sequences; allocate next KV block if needed
+        var ri: u32 = 0;
+        while ri < self.n_running {
+            let seq_idx = self.running[ri as usize];
+            let seq = unsafe { &var *self.seqs.add(seq_idx as usize) };
+
+            // Allocate new KV block if we just crossed a block boundary
+            let cur_blocks = (seq.len + KV_BLOCK_TOKENS - 1) / KV_BLOCK_TOKENS;
+            let need_blocks = (seq.len + 1 + KV_BLOCK_TOKENS - 1) / KV_BLOCK_TOKENS;
+            if need_blocks > cur_blocks {
+                let blk = pool.alloc();
+                if blk == KV_NULL {
+                    // Preempt: swap this sequence (lowest priority among running)
+                    self.preempt_lowest(pool);
+                } else {
+                    seq.block_table.push(blk);
+                }
+            }
+
+            if seq.len < seq.max_len {
+                unsafe { *dec_buf.add(n_dec as usize) = seq.id; }
+                n_dec += 1;
+            } else {
+                seq.state = SeqState::Finished;
+            }
+            ri += 1;
+        }
+
+        // Clean up finished sequences from running list
+        self.evict_finished();
+
+        SchedulerOutput {
+            prefill_ids: pfill_buf,
+            decode_ids:  dec_buf,
+            n_prefill:   n_pfill,
+            n_decode:    n_dec,
+        }
+    }
+
+    /// Find the sequence by ID and append a decoded token.
+    pub fn append_token(self: &var Scheduler, seq_id: u64, token: u32) {
+        var i: u32 = 0;
+        while i < self.n_seqs {
+            let seq = unsafe { &var *self.seqs.add(i as usize) };
+            if seq.id == seq_id {
+                if seq.len < seq.max_len {
+                    unsafe { *seq.tokens.add(seq.len as usize) = token; }
+                    seq.len += 1;
+                    seq.n_output += 1;
+                }
+                return;
+            }
+            i += 1;
+        }
+    }
+
+    /// Mark a sequence as finished.
+    pub fn finish(self: &var Scheduler, seq_id: u64) {
+        var i: u32 = 0;
+        while i < self.n_seqs {
+            let seq = unsafe { &var *self.seqs.add(i as usize) };
+            if seq.id == seq_id { seq.state = SeqState::Finished; return; }
+            i += 1;
+        }
+    }
+
+    /// Get output tokens for a sequence (const view).
+    pub fn get_output(self: &Scheduler, seq_id: u64) -> (*u32, u32) {
+        var i: u32 = 0;
+        while i < self.n_seqs {
+            let seq = unsafe { &*self.seqs.add(i as usize) };
+            if seq.id == seq_id {
+                let start = unsafe { seq.tokens.add(seq.prompt_len as usize) };
+                return (start, seq.n_output);
+            }
+            i += 1;
+        }
+        (0 as *u32, 0)
+    }
+
+    pub fn is_finished(self: &Scheduler, seq_id: u64) -> bool {
+        var i: u32 = 0;
+        while i < self.n_seqs {
+            let seq = unsafe { &*self.seqs.add(i as usize) };
+            if seq.id == seq_id {
+                match seq.state {
+                    SeqState::Finished => { return true; }
+                    _ => { return false; }
+                }
+            }
+            i += 1;
+        }
+        true  // unknown = treat as done
+    }
+
+    // ── Private helpers ───────────────────────────────────────────────────────
+
+    fn preempt_lowest(self: &var Scheduler, pool: &var BlockAllocator) {
+        if self.n_running == 0 { return; }
+        var worst_idx: u32 = 0;
+        var worst_pri: u32 = 0;
+        var ri: u32 = 0;
+        while ri < self.n_running {
+            let seq = unsafe { &*self.seqs.add(self.running[ri as usize] as usize) };
+            if seq.priority > worst_pri { worst_pri = seq.priority; worst_idx = ri; }
+            ri += 1;
+        }
+        let seq_idx = self.running[worst_idx as usize];
+        let seq = unsafe { &var *self.seqs.add(seq_idx as usize) };
+        seq.block_table.free_blocks(pool);
+        seq.state = SeqState::Swapped;
+        if self.n_swapped < 256 {
+            self.swapped[self.n_swapped as usize] = seq_idx;
+            self.n_swapped += 1;
+        }
+        // Remove from running
+        var wi = worst_idx;
+        while wi + 1 < self.n_running {
+            self.running[wi as usize] = self.running[(wi + 1) as usize];
+            wi += 1;
+        }
+        self.n_running -= 1;
+    }
+
+    fn evict_finished(self: &var Scheduler) {
+        var ri: u32 = 0;
+        while ri < self.n_running {
+            let seq = unsafe { &*self.seqs.add(self.running[ri as usize] as usize) };
+            match seq.state {
+                SeqState::Finished => {
+                    var wj = ri;
+                    while wj + 1 < self.n_running {
+                        self.running[wj as usize] = self.running[(wj + 1) as usize];
+                        wj += 1;
+                    }
+                    self.n_running -= 1;
+                    // Don't increment ri
+                }
+                _ => { ri += 1; }
+            }
+        }
+    }
+}

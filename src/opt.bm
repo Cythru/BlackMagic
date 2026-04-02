@@ -1,0 +1,434 @@
+/// BlackMagic Optimisation Passes (Juicer Core)
+///
+/// Passes run on MIR after initial lowering.
+/// Ordered: simple canonicalisation → DCE → const-prop → inlining → strength reduction
+///
+/// Each pass implements `OptPass` and transforms `MirFunction` in place.
+
+use std::collections::{HashMap, HashSet};
+use crate::mir::*;
+use crate::types::TypeId;
+
+// ─── Pass trait ────────────────────────────────────────────────────────────
+
+pub trait OptPass {
+    fn name(&self) -> &'static str;
+    fn run(&self, func: &mut MirFunction) -> bool; // returns true if changed
+}
+
+// ─── Pass manager ─────────────────────────────────────────────────────────
+
+pub struct PassManager {
+    passes: Vec<Box<dyn OptPass>>,
+}
+
+impl PassManager {
+    /// Standard pipeline (juicer default)
+    pub fn standard() -> Self {
+        PassManager {
+            passes: vec![
+                Box::new(ConstantPropagation),
+                Box::new(DeadCodeElimination),
+                Box::new(CommonSubexpressionElimination),
+                Box::new(StrengthReduction),
+                Box::new(TailCallElimination),
+                Box::new(CopyPropagation),
+                Box::new(BlockMerging),
+            ],
+        }
+    }
+
+    /// Sicko mode: run everything repeatedly until fixpoint
+    pub fn sicko() -> Self {
+        PassManager {
+            passes: vec![
+                Box::new(ConstantPropagation),
+                Box::new(DeadCodeElimination),
+                Box::new(CommonSubexpressionElimination),
+                Box::new(LoopInvariantCodeMotion),
+                Box::new(StrengthReduction),
+                Box::new(Inliner { threshold: 200 }),
+                Box::new(TailCallElimination),
+                Box::new(CopyPropagation),
+                Box::new(BlockMerging),
+                Box::new(AggressiveInliner),
+                Box::new(VectorizationHint),
+            ],
+        }
+    }
+
+    /// Returns number of fixpoint iterations executed
+    pub fn run(&mut self, func: &mut MirFunction) -> usize {
+        let mut changed = true;
+        let mut iterations = 0;
+        while changed && iterations < 64 {
+            changed = false;
+            for pass in &self.passes {
+                if pass.run(func) { changed = true; }
+            }
+            iterations += 1;
+        }
+        iterations
+    }
+
+    pub fn run_module(&mut self, module: &mut MirModule) {
+        for func in module.functions.values_mut() {
+            self.run(func);
+        }
+    }
+
+    pub fn pass_names(&self) -> Vec<&'static str> {
+        self.passes.iter().map(|p| p.name()).collect()
+    }
+}
+
+// ─── Constant Propagation ─────────────────────────────────────────────────
+
+pub struct ConstantPropagation;
+
+impl OptPass for ConstantPropagation {
+    fn name(&self) -> &'static str { "const-prop" }
+
+    fn run(&self, func: &mut MirFunction) -> bool {
+        let mut const_map: HashMap<Local, Const> = HashMap::new();
+        let mut changed = false;
+
+        for block in func.blocks.iter_mut() {
+            for stmt in block.stmts.iter_mut() {
+                if let MirStmtKind::Assign { dest: MirPlace::Local(dest), value: Rvalue::Use(Operand::Const(c)) } = &stmt.kind {
+                    const_map.insert(*dest, c.clone());
+                }
+                // Replace Local operands with constants
+                changed |= substitute_consts_in_stmt(stmt, &const_map);
+            }
+        }
+        changed
+    }
+}
+
+fn substitute_consts_in_stmt(stmt: &mut MirStmt, map: &HashMap<Local, Const>) -> bool {
+    match &mut stmt.kind {
+        MirStmtKind::Assign { value, .. } => substitute_rvalue(value, map),
+        MirStmtKind::Perform { args, .. } => {
+            let mut ch = false;
+            for a in args { ch |= substitute_operand(a, map); }
+            ch
+        }
+        _ => false,
+    }
+}
+
+fn substitute_rvalue(rv: &mut Rvalue, map: &HashMap<Local, Const>) -> bool {
+    match rv {
+        Rvalue::Use(op) | Rvalue::SimdSplat(op, _) => substitute_operand(op, map),
+        Rvalue::BinOp(_, a, b) | Rvalue::SimdBinOp(_, a, b) => {
+            let ca = substitute_operand(a, map);
+            let cb = substitute_operand(b, map);
+            ca | cb
+        }
+        Rvalue::UnaryOp(_, op) => substitute_operand(op, map),
+        Rvalue::Aggregate(_, ops) => {
+            let mut ch = false;
+            for o in ops { ch |= substitute_operand(o, map); }
+            ch
+        }
+        _ => false,
+    }
+}
+
+fn substitute_operand(op: &mut Operand, map: &HashMap<Local, Const>) -> bool {
+    if let Operand::Local(l) = op {
+        if let Some(c) = map.get(l) {
+            *op = Operand::Const(c.clone());
+            return true;
+        }
+    }
+    false
+}
+
+// ─── Dead Code Elimination ────────────────────────────────────────────────
+
+pub struct DeadCodeElimination;
+
+impl OptPass for DeadCodeElimination {
+    fn name(&self) -> &'static str { "dce" }
+
+    fn run(&self, func: &mut MirFunction) -> bool {
+        // Collect used locals
+        let mut used: HashSet<Local> = HashSet::new();
+        // Return value and args are always live
+        for &arg in &func.args { used.insert(arg); }
+
+        for block in &func.blocks {
+            for stmt in &block.stmts {
+                collect_used_stmt(stmt, &mut used);
+            }
+            collect_used_term(&block.terminator, &mut used);
+        }
+
+        let mut changed = false;
+        for block in func.blocks.iter_mut() {
+            block.stmts.retain(|stmt| {
+                if let MirStmtKind::Assign { dest: MirPlace::Local(l), .. } = &stmt.kind {
+                    if !used.contains(l) {
+                        changed = true;
+                        return false;
+                    }
+                }
+                true
+            });
+        }
+        changed
+    }
+}
+
+fn collect_used_stmt(stmt: &MirStmt, set: &mut HashSet<Local>) {
+    match &stmt.kind {
+        MirStmtKind::Assign { value, .. } => collect_used_rvalue(value, set),
+        MirStmtKind::Perform { args, dest, .. } => {
+            for a in args { collect_used_op(a, set); }
+            if let Some(d) = dest { set.insert(*d); }
+        }
+        _ => {}
+    }
+}
+
+fn collect_used_rvalue(rv: &Rvalue, set: &mut HashSet<Local>) {
+    match rv {
+        Rvalue::Use(o) | Rvalue::SimdSplat(o, _) => collect_used_op(o, set),
+        Rvalue::BinOp(_, a, b) | Rvalue::SimdBinOp(_, a, b) => {
+            collect_used_op(a, set);
+            collect_used_op(b, set);
+        }
+        Rvalue::UnaryOp(_, o) => collect_used_op(o, set),
+        Rvalue::Aggregate(_, ops) => { for o in ops { collect_used_op(o, set); } }
+        Rvalue::Cast(o, _) => collect_used_op(o, set),
+        Rvalue::Discriminant(o) => collect_used_op(o, set),
+        _ => {}
+    }
+}
+
+fn collect_used_term(term: &Terminator, set: &mut HashSet<Local>) {
+    match term {
+        Terminator::Return(Some(o)) => collect_used_op(o, set),
+        Terminator::Branch { cond, .. } => collect_used_op(cond, set),
+        Terminator::Switch { discrim, .. } => collect_used_op(discrim, set),
+        Terminator::Call { func, args, dest, .. } => {
+            collect_used_op(func, set);
+            for a in args { collect_used_op(a, set); }
+            if let Some(d) = dest { set.insert(*d); }
+        }
+        _ => {}
+    }
+}
+
+fn collect_used_op(op: &Operand, set: &mut HashSet<Local>) {
+    if let Operand::Local(l) = op { set.insert(*l); }
+}
+
+// ─── Common Subexpression Elimination ────────────────────────────────────
+
+pub struct CommonSubexpressionElimination;
+
+impl OptPass for CommonSubexpressionElimination {
+    fn name(&self) -> &'static str { "cse" }
+
+    fn run(&self, func: &mut MirFunction) -> bool {
+        // Value numbering: map (rvalue fingerprint) → Local
+        let mut vn: HashMap<String, Local> = HashMap::new();
+        let mut changed = false;
+
+        for block in func.blocks.iter_mut() {
+            for stmt in block.stmts.iter_mut() {
+                if let MirStmtKind::Assign { dest: MirPlace::Local(dest), value } = &mut stmt.kind {
+                    let key = format!("{:?}", value); // fingerprint by Debug repr
+                    if let Some(&prev) = vn.get(&key) {
+                        // Replace with copy of previous result
+                        *value = Rvalue::Use(Operand::Local(prev));
+                        changed = true;
+                    } else {
+                        vn.insert(key, *dest);
+                    }
+                }
+            }
+        }
+        changed
+    }
+}
+
+// ─── Strength Reduction ────────────────────────────────────────────────────
+
+pub struct StrengthReduction;
+
+impl OptPass for StrengthReduction {
+    fn name(&self) -> &'static str { "strength-reduce" }
+
+    fn run(&self, func: &mut MirFunction) -> bool {
+        let mut changed = false;
+        for block in func.blocks.iter_mut() {
+            for stmt in block.stmts.iter_mut() {
+                if let MirStmtKind::Assign { value: Rvalue::BinOp(op, a, b), .. } = &mut stmt.kind {
+                    // x * 2 → x + x; x * 1 → x; x * 0 → 0; x / 1 → x
+                    match (op, a.clone(), b.clone()) {
+                        (BinOpKind::Mul, _, Operand::Const(Const::Int(1))) => {
+                            *stmt.kind_as_rvalue_mut().unwrap() = Rvalue::Use(a.clone());
+                            changed = true;
+                        }
+                        (BinOpKind::Mul, _, Operand::Const(Const::Int(0))) => {
+                            *stmt.kind_as_rvalue_mut().unwrap() = Rvalue::Use(Operand::Const(Const::Int(0)));
+                            changed = true;
+                        }
+                        (BinOpKind::Div, _, Operand::Const(Const::Int(1))) => {
+                            *stmt.kind_as_rvalue_mut().unwrap() = Rvalue::Use(a.clone());
+                            changed = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        changed
+    }
+}
+
+// Helper to get mutable rvalue from stmt
+trait StmtExt {
+    fn kind_as_rvalue_mut(&mut self) -> Option<&mut Rvalue>;
+}
+impl StmtExt for MirStmt {
+    fn kind_as_rvalue_mut(&mut self) -> Option<&mut Rvalue> {
+        if let MirStmtKind::Assign { value, .. } = &mut self.kind { Some(value) } else { None }
+    }
+}
+
+// ─── Loop Invariant Code Motion ────────────────────────────────────────────
+
+pub struct LoopInvariantCodeMotion;
+
+impl OptPass for LoopInvariantCodeMotion {
+    fn name(&self) -> &'static str { "licm" }
+
+    fn run(&self, _func: &mut MirFunction) -> bool {
+        // Full LICM requires loop analysis (dominator tree + back-edges).
+        // Skeleton: find back-edges, identify loop bodies, hoist invariant stmts.
+        // TODO: implement after dominator tree infrastructure
+        false
+    }
+}
+
+// ─── Inliner ──────────────────────────────────────────────────────────────
+
+pub struct Inliner { pub threshold: usize }
+
+impl OptPass for Inliner {
+    fn name(&self) -> &'static str { "inline" }
+
+    fn run(&self, func: &mut MirFunction) -> bool {
+        // Inline call sites where callee instruction count < threshold.
+        // Requires access to the full module — handled at module level.
+        // Skeleton: scan for Call terminators, check callee size, splice blocks.
+        let _ = self.threshold;
+        false
+    }
+}
+
+pub struct AggressiveInliner;
+impl OptPass for AggressiveInliner {
+    fn name(&self) -> &'static str { "inline-aggressive" }
+    fn run(&self, _func: &mut MirFunction) -> bool { false }
+}
+
+// ─── Tail Call Elimination ────────────────────────────────────────────────
+
+pub struct TailCallElimination;
+
+impl OptPass for TailCallElimination {
+    fn name(&self) -> &'static str { "tce" }
+
+    fn run(&self, func: &mut MirFunction) -> bool {
+        let mut changed = false;
+        let fname = func.name.clone();
+        let entry = func.entry;
+
+        for block in func.blocks.iter_mut() {
+            if let Terminator::Call { func: Operand::Func(callee), args, dest, .. } = &block.terminator {
+                // Self-recursive tail call → Goto(entry) with arg rebinds
+                if *callee == fname {
+                    let new_args = args.clone();
+                    // Rewrite: assign args to param slots, jump to entry
+                    let stmts: Vec<MirStmt> = new_args.into_iter().enumerate().map(|(i, a)| {
+                        MirStmt {
+                            kind: MirStmtKind::Assign {
+                                dest:  MirPlace::Local(Local(i as u32)),
+                                value: Rvalue::Use(a),
+                            },
+                            span: crate::error::Span::default(),
+                        }
+                    }).collect();
+                    block.stmts.extend(stmts);
+                    block.terminator = Terminator::Goto { target: entry };
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+}
+
+// ─── Copy Propagation ─────────────────────────────────────────────────────
+
+pub struct CopyPropagation;
+
+impl OptPass for CopyPropagation {
+    fn name(&self) -> &'static str { "copy-prop" }
+
+    fn run(&self, func: &mut MirFunction) -> bool {
+        let mut copies: HashMap<Local, Operand> = HashMap::new();
+        let mut changed = false;
+
+        for block in func.blocks.iter_mut() {
+            for stmt in block.stmts.iter_mut() {
+                if let MirStmtKind::Assign { dest: MirPlace::Local(d), value: Rvalue::Use(op) } = &stmt.kind {
+                    copies.insert(*d, op.clone());
+                }
+                changed |= substitute_consts_in_stmt(stmt, &copies.iter()
+                    .filter_map(|(k, v)| if let Operand::Const(c) = v { Some((*k, c.clone())) } else { None })
+                    .collect());
+            }
+        }
+        changed
+    }
+}
+
+// ─── Block Merging ────────────────────────────────────────────────────────
+
+pub struct BlockMerging;
+
+impl OptPass for BlockMerging {
+    fn name(&self) -> &'static str { "block-merge" }
+
+    fn run(&self, func: &mut MirFunction) -> bool {
+        // Merge bb_a → bb_b when bb_a's only successor is bb_b
+        // and bb_b has exactly one predecessor.
+        // Skeleton: requires predecessor count analysis.
+        false
+    }
+}
+
+// ─── Vectorization Hint ───────────────────────────────────────────────────
+/// Tags loops that are vectorizable (for codegen to emit SIMD).
+
+pub struct VectorizationHint;
+
+impl OptPass for VectorizationHint {
+    fn name(&self) -> &'static str { "vec-hint" }
+
+    fn run(&self, _func: &mut MirFunction) -> bool {
+        // Walk back-edges, check for:
+        //   - Simple induction variable
+        //   - No loop-carried dependencies
+        //   - Body is a single basic block with only arithmetic
+        // If all conditions met, annotate loop header with VectorHint metadata
+        false
+    }
+}

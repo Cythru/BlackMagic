@@ -1,0 +1,217 @@
+/// BlackMagic — Modularity Philosophy
+/// Shows: parametric modules, interfaces, first-class modules, hot-reload
+
+module modularity_demo
+
+// ─── Module interfaces (signatures) ──────────────────────────────────────────
+
+interface Container {
+    type Item
+    fn new() -> Self
+    fn insert(self: &mut Self, item: Self::Item) -> ()
+    fn remove(self: &mut Self, item: &Self::Item) -> bool
+    fn contains(self: &Self, item: &Self::Item) -> bool
+    fn len(self: &Self) -> usize
+    fn is_empty(self: &Self) -> bool {   // default implementation
+        self.len() == 0
+    }
+}
+
+interface Map {
+    type Key
+    type Value
+    fn new() -> Self
+    fn insert(self: &mut Self, k: Self::Key, v: Self::Value) -> ?Self::Value
+    fn get(self: &Self, k: &Self::Key) -> ?&Self::Value
+    fn remove(self: &mut Self, k: &Self::Key) -> ?Self::Value
+    fn len(self: &Self) -> usize
+}
+
+// ─── Parametric modules ───────────────────────────────────────────────────────
+
+/// A parametric Vec module — generic over element type T.
+/// Fully zero-cost: each instantiation is monomorphised.
+module Vec(T: type) implements Container where T: Copy {
+    pub type Item = T
+
+    pub struct Vec {
+        data: owned *T,
+        len:  usize,
+        cap:  usize,
+    }
+
+    pub fn new() -> Vec {
+        Vec { data: null, len: 0, cap: 0 }
+    }
+
+    pub fn with_capacity(cap: usize) -> Vec {
+        let data = std::alloc::heap.alloc_array::<T>(cap)
+        Vec { data, len: 0, cap }
+    }
+
+    pub fn insert(self: &mut Vec, item: T) -> () { self.push(item) }
+
+    pub fn push(self: &mut Vec, item: T) -> () {
+        if self.len == self.cap { self.grow() }
+        unsafe { *self.data.offset(self.len as isize) = item }
+        self.len += 1
+    }
+
+    pub fn pop(self: &mut Vec) -> ?T {
+        if self.len == 0 { return null }
+        self.len -= 1
+        .Some(unsafe { *self.data.offset(self.len as isize) })
+    }
+
+    pub fn get(self: &Vec, idx: usize) -> &T {
+        assert!(idx < self.len, "index {idx} out of bounds (len={})", self.len)
+        unsafe { &*self.data.offset(idx as isize) }
+    }
+
+    pub fn remove(self: &mut Vec, item: &T) -> bool {
+        for i in 0..self.len {
+            if *self.get(i) == *item {
+                // shift remaining elements
+                for j in i..self.len-1 {
+                    unsafe {
+                        *self.data.offset(j as isize) =
+                            *self.data.offset((j+1) as isize)
+                    }
+                }
+                self.len -= 1
+                return true
+            }
+        }
+        false
+    }
+
+    pub fn contains(self: &Vec, item: &T) -> bool {
+        for i in 0..self.len { if *self.get(i) == *item { return true } }
+        false
+    }
+
+    pub fn len(self: &Vec) -> usize { self.len }
+
+    // Iterator support
+    pub fn iter(self: &Vec) -> VecIter<T> {
+        VecIter { vec: self, pos: 0 }
+    }
+
+    fn grow(self: &mut Vec) -> () {
+        let new_cap = if self.cap == 0 { 4 } else { self.cap * 2 }
+        let new_data = std::alloc::heap.alloc_array::<T>(new_cap)
+        unsafe {
+            std::mem::copy(new_data, self.data, self.len)
+            std::alloc::heap.free(self.data)
+        }
+        self.data = new_data
+        self.cap  = new_cap
+    }
+
+    struct VecIter<T> { vec: &Vec, pos: usize }
+    impl VecIter<T> {
+        fn next(self: &mut VecIter) -> ?&T {
+            if self.pos >= self.vec.len { return null }
+            let item = self.vec.get(self.pos)
+            self.pos += 1
+            .Some(item)
+        }
+    }
+}
+
+// Instantiate the Vec module with different types — all zero-cost
+let IntVec    = Vec(i32)
+let FloatVec  = Vec(f64)
+let StringVec = Vec(str)
+
+// ─── Generic function over any Container ─────────────────────────────────────
+
+/// Works with ANY type implementing Container — no boxing
+fn fill<C: Container>(container: &mut C, items: &[C::Item])
+where C::Item: Copy
+{
+    for &item in items {
+        container.insert(item)
+    }
+}
+
+fn count_matching<C: Container>(
+    container: &C,
+    pred: fn(&C::Item) -> bool,
+) -> usize {
+    var n = 0usize
+    // (would iterate in a real impl)
+    n
+}
+
+// ─── First-class modules ─────────────────────────────────────────────────────
+
+/// A function that takes a MODULE as an argument (functor)
+fn benchmark<M: Map>(map_module: M) !IO {
+    use std::io::println
+    var m = map_module.new()
+    // Fill with 1M entries
+    for i in 0..1_000_000u64 {
+        m.insert(i, i * i)
+    }
+    println("map has {} entries", m.len())
+}
+
+// ─── Hot-reloadable module ───────────────────────────────────────────────────
+
+#[hot_reload]
+module GameLogic {
+    pub struct GameState {
+        score:  u64,
+        health: i32,
+        level:  u32,
+    }
+
+    pub fn tick(state: &mut GameState, dt_ms: u64) -> () {
+        // Game logic — can be swapped at runtime without restarting
+        if state.health <= 0 { return }
+        state.score += dt_ms * state.level as u64
+    }
+
+    pub fn handle_input(state: &mut GameState, input: u8) -> () {
+        match input {
+            b'w' | 119 => { /* move up */ }
+            b's' | 115 => { /* move down */ }
+            b' ' | 32  => { state.score += 100 }
+            _ => {}
+        }
+    }
+}
+
+// ─── Main demonstration ───────────────────────────────────────────────────────
+
+fn main() !IO {
+    use std::io::println
+
+    // Parametric Vec
+    var v: IntVec::Vec = IntVec::new()
+    IntVec::push(&mut v, 10)
+    IntVec::push(&mut v, 20)
+    IntVec::push(&mut v, 30)
+    println("vec len = {}", IntVec::len(&v))  // 3
+    println("contains 20? {}", IntVec::contains(&v, &20))  // true
+
+    // UFCS: call module functions as methods (sugar)
+    var fv: FloatVec::Vec = FloatVec::new()
+    fv.push(1.0)
+    fv.push(2.0)
+    fv.push(3.0)
+    println("float vec len = {}", fv.len())
+
+    // Generic fill
+    var sv: IntVec::Vec = IntVec::new()
+    fill(&mut sv, &[100, 200, 300, 400, 500])
+    println("after fill: len = {}", sv.len())  // 5
+
+    // Hot-reload demo
+    var state = GameLogic::GameState { score: 0, health: 100, level: 1 }
+    GameLogic::tick(&mut state, 16)
+    GameLogic::tick(&mut state, 16)
+    GameLogic::handle_input(&mut state, b' ')
+    println("score = {}", state.score)
+}

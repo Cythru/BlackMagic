@@ -1,0 +1,469 @@
+/// BlackMagic Engine — physics/world2d.bm
+///
+/// 2D physics world — pure BlackMagic AABB/circle narrow-phase,
+/// iterative impulse resolution, broadphase spatial hash.
+///
+/// Implements: static bodies, kinematic bodies, rigid bodies,
+/// AABB+circle collision shapes, overlap queries.
+
+use engine::core::math::{
+    Vec2, Rect2, clampf, fabsf, sqrt, EPSILON
+};
+use bm::collections::{ Vec as BmVec, HashMap };
+
+// ─── ShapeType ────────────────────────────────────────────────────────────
+
+pub enum Shape2D {
+    AABB   { half_extents: Vec2 },
+    Circle { radius: f32 },
+    Capsule { radius: f32, height: f32 },
+}
+
+// ─── BodyType ─────────────────────────────────────────────────────────────
+
+pub enum BodyType { Static, Kinematic, Dynamic }
+
+// ─── Body2D ───────────────────────────────────────────────────────────────
+
+pub struct Body2D {
+    pub id:        u32,
+    pub body_type: BodyType,
+    pub shape:     Shape2D,
+
+    // State
+    pub pos:      Vec2,
+    pub vel:      Vec2,
+    pub angle:    f32,
+    pub omega:    f32,   // angular velocity (rad/s)
+
+    // Material
+    pub mass:        f32,   // 0 = infinite (static/kinematic)
+    pub inv_mass:    f32,
+    pub restitution: f32,   // [0,1] bounciness
+    pub friction:    f32,   // [0,1] surface friction
+
+    // Flags
+    pub active:       bool,
+    pub trigger:      bool,  // no impulse, only overlap callbacks
+    pub lock_rotation: bool,
+
+    // Per-frame accumulation
+    _force: Vec2,
+    _torque: f32,
+}
+
+impl Body2D {
+    pub fn new_dynamic(id: u32, shape: Shape2D, mass: f32, pos: Vec2) -> Body2D {
+        Body2D {
+            id, body_type: BodyType::Dynamic, shape,
+            pos, vel: Vec2::zero(), angle: 0.0, omega: 0.0,
+            mass, inv_mass: if mass > EPSILON { 1.0/mass } else { 0.0 },
+            restitution: 0.3, friction: 0.5,
+            active: true, trigger: false, lock_rotation: false,
+            _force: Vec2::zero(), _torque: 0.0,
+        }
+    }
+
+    pub fn new_static(id: u32, shape: Shape2D, pos: Vec2) -> Body2D {
+        Body2D {
+            id, body_type: BodyType::Static, shape,
+            pos, vel: Vec2::zero(), angle: 0.0, omega: 0.0,
+            mass: 0.0, inv_mass: 0.0,
+            restitution: 0.3, friction: 0.5,
+            active: true, trigger: false, lock_rotation: false,
+            _force: Vec2::zero(), _torque: 0.0,
+        }
+    }
+
+    pub fn new_kinematic(id: u32, shape: Shape2D, pos: Vec2) -> Body2D {
+        Body2D {
+            id, body_type: BodyType::Kinematic, shape,
+            pos, vel: Vec2::zero(), angle: 0.0, omega: 0.0,
+            mass: 0.0, inv_mass: 0.0,
+            restitution: 0.0, friction: 0.3,
+            active: true, trigger: false, lock_rotation: false,
+            _force: Vec2::zero(), _torque: 0.0,
+        }
+    }
+
+    pub fn apply_force(self: &var Body2D, f: Vec2) { self._force = self._force.add(f); }
+    pub fn apply_impulse(self: &var Body2D, j: Vec2) { self.vel = self.vel.add(j.scale(self.inv_mass)); }
+    pub fn clear_forces(self: &var Body2D) { self._force = Vec2::zero(); self._torque = 0.0; }
+
+    pub fn aabb(self: &Body2D) -> Rect2 {
+        match self.shape {
+            Shape2D::AABB { half_extents: he } => {
+                Rect2::new(self.pos.x - he.x, self.pos.y - he.y, he.x*2.0, he.y*2.0)
+            }
+            Shape2D::Circle { radius: r } => {
+                Rect2::new(self.pos.x - r, self.pos.y - r, r*2.0, r*2.0)
+            }
+            Shape2D::Capsule { radius: r, height: h } => {
+                Rect2::new(self.pos.x - r, self.pos.y - h*0.5 - r, r*2.0, h + r*2.0)
+            }
+        }
+    }
+}
+
+// ─── Contact ──────────────────────────────────────────────────────────────
+
+pub struct Contact {
+    pub body_a: u32,
+    pub body_b: u32,
+    pub normal: Vec2,      // from A toward B
+    pub depth:  f32,       // penetration depth
+    pub point:  Vec2,      // contact world position
+}
+
+// ─── Spatial hash broadphase ──────────────────────────────────────────────
+
+pub struct SpatialHash {
+    cell_size: f32,
+    cells:     HashMap<u64, BmVec<u32>>,  // cell_key → [body_id]
+}
+
+impl SpatialHash {
+    pub fn new(cell_size: f32) -> SpatialHash {
+        SpatialHash { cell_size, cells: HashMap::new() }
+    }
+
+    pub fn clear(self: &var SpatialHash) { self.cells.clear(); }
+
+    pub fn insert(self: &var SpatialHash, id: u32, aabb: Rect2) {
+        let x0 = floori(aabb.pos.x / self.cell_size);
+        let y0 = floori(aabb.pos.y / self.cell_size);
+        let x1 = floori((aabb.pos.x + aabb.size.x) / self.cell_size);
+        let y1 = floori((aabb.pos.y + aabb.size.y) / self.cell_size);
+        var cx = x0;
+        while cx <= x1 {
+            var cy = y0;
+            while cy <= y1 {
+                let key = hash_cell(cx, cy);
+                match self.cells.get_mut(key) {
+                    Some(list) => { list.push(id); }
+                    None => {
+                        var v = BmVec::new(); v.push(id);
+                        self.cells.insert(key, v);
+                    }
+                }
+                cy += 1;
+            }
+            cx += 1;
+        }
+    }
+
+    pub fn query_aabb(self: &SpatialHash, aabb: Rect2, out: &var BmVec<u32>) {
+        out.clear();
+        let x0 = floori(aabb.pos.x / self.cell_size);
+        let y0 = floori(aabb.pos.y / self.cell_size);
+        let x1 = floori((aabb.pos.x + aabb.size.x) / self.cell_size);
+        let y1 = floori((aabb.pos.y + aabb.size.y) / self.cell_size);
+        var cx = x0;
+        while cx <= x1 {
+            var cy = y0;
+            while cy <= y1 {
+                let key = hash_cell(cx, cy);
+                match self.cells.get(key) {
+                    Some(list) => {
+                        var i: usize = 0;
+                        while i < list.len() {
+                            let id = list[i];
+                            if !out.contains(id) { out.push(id); }
+                            i += 1;
+                        }
+                    }
+                    None => {}
+                }
+                cy += 1;
+            }
+            cx += 1;
+        }
+    }
+}
+
+fn hash_cell(x: i32, y: i32) -> u64 {
+    // Cantor pairing on signed ints
+    let ux = (x * 2 + if x < 0 { 1 } else { 0 }) as u64;
+    let uy = (y * 2 + if y < 0 { 1 } else { 0 }) as u64;
+    (ux + uy) * (ux + uy + 1) / 2 + uy
+}
+
+fn floori(x: f32) -> i32 {
+    let i = x as i32;
+    if x < 0.0 && x != i as f32 { i - 1 } else { i }
+}
+
+// ─── Narrow-phase collision detection ─────────────────────────────────────
+
+/// Returns Some(Contact) if a and b overlap, else None.
+pub fn test_collision(a: &Body2D, b: &Body2D) -> Option<Contact> {
+    let a_aabb = match &a.shape { Shape2D::AABB { .. } => true, _ => false };
+    let b_aabb = match &b.shape { Shape2D::AABB { .. } => true, _ => false };
+
+    if a_aabb && b_aabb {
+        let ha = match &a.shape { Shape2D::AABB { half_extents } => *half_extents, _ => Vec2::zero() };
+        let hb = match &b.shape { Shape2D::AABB { half_extents } => *half_extents, _ => Vec2::zero() };
+        aabb_vs_aabb(a.pos, ha, b.pos, hb, a.id, b.id)
+    } else if !a_aabb && !b_aabb {
+        let ra = match &a.shape { Shape2D::Circle { radius } => *radius, _ => 0.0 };
+        let rb = match &b.shape { Shape2D::Circle { radius } => *radius, _ => 0.0 };
+        circle_vs_circle(a.pos, ra, b.pos, rb, a.id, b.id)
+    } else if a_aabb && !b_aabb {
+        let ha = match &a.shape { Shape2D::AABB { half_extents } => *half_extents, _ => Vec2::zero() };
+        let rb = match &b.shape { Shape2D::Circle { radius } => *radius, _ => 0.0 };
+        aabb_vs_circle(a.pos, ha, b.pos, rb, a.id, b.id)
+    } else {
+        // Circle a vs AABB b — swap roles and flip normal
+        let ra = match &a.shape { Shape2D::Circle { radius } => *radius, _ => 0.0 };
+        let hb = match &b.shape { Shape2D::AABB { half_extents } => *half_extents, _ => Vec2::zero() };
+        match aabb_vs_circle(b.pos, hb, a.pos, ra, b.id, a.id) {
+            Some(contact) => {
+                var c = contact;
+                c.normal = c.normal.scale(-1.0);
+                c.body_a = a.id;
+                c.body_b = b.id;
+                ?c
+            }
+            None => None
+        }
+    }
+}
+
+fn aabb_vs_aabb(pa: Vec2, ha: Vec2, pb: Vec2, hb: Vec2, aid: u32, bid: u32) -> Option<Contact> {
+    let dx = pb.x - pa.x;
+    let dy = pb.y - pa.y;
+    let ox = ha.x + hb.x - fabsf(dx);
+    let oy = ha.y + hb.y - fabsf(dy);
+    if ox <= 0.0 || oy <= 0.0 { return None; }
+    var normal: Vec2;
+    var depth: f32;
+    if ox < oy {
+        normal = Vec2::new(if dx > 0.0 { 1.0 } else { -1.0 }, 0.0);
+        depth  = ox;
+    } else {
+        normal = Vec2::new(0.0, if dy > 0.0 { 1.0 } else { -1.0 });
+        depth  = oy;
+    }
+    let point = pa.lerp(pb, 0.5);
+    ?Contact{ body_a:aid, body_b:bid, normal, depth, point }
+}
+
+fn circle_vs_circle(pa: Vec2, ra: f32, pb: Vec2, rb: f32, aid: u32, bid: u32) -> Option<Contact> {
+    let d = pb.sub(pa);
+    let dist_sq = d.length_sq();
+    let sum_r   = ra + rb;
+    if dist_sq >= sum_r * sum_r { return None; }
+    let dist   = sqrt(dist_sq);
+    let normal = if dist < EPSILON { Vec2::right() } else { d.scale(1.0/dist) };
+    let depth  = sum_r - dist;
+    let point  = pa.add(normal.scale(ra - depth * 0.5));
+    ?Contact{ body_a:aid, body_b:bid, normal, depth, point }
+}
+
+fn aabb_vs_circle(aabb_pos: Vec2, half: Vec2, circle_pos: Vec2, radius: f32,
+                  aid: u32, bid: u32) -> Option<Contact> {
+    let closest = Vec2 {
+        x: clampf(circle_pos.x, aabb_pos.x - half.x, aabb_pos.x + half.x),
+        y: clampf(circle_pos.y, aabb_pos.y - half.y, aabb_pos.y + half.y),
+    };
+    let d = circle_pos.sub(closest);
+    let dist_sq = d.length_sq();
+    if dist_sq >= radius * radius { return None; }
+    let dist = sqrt(dist_sq);
+    let normal = if dist < EPSILON { Vec2::up() } else { d.scale(1.0/dist) };
+    let depth  = radius - dist;
+    ?Contact{ body_a:aid, body_b:bid, normal, depth, point:closest }
+}
+
+// ─── PhysicsWorld2D ───────────────────────────────────────────────────────
+
+pub struct PhysicsWorld2D {
+    pub bodies:  BmVec<Body2D>,
+    pub gravity: Vec2,
+    broadphase:  SpatialHash,
+    contacts:    BmVec<Contact>,
+    _next_id:    u32,
+}
+
+impl PhysicsWorld2D {
+    pub fn new() -> PhysicsWorld2D {
+        PhysicsWorld2D {
+            bodies:     BmVec::new(),
+            gravity:    Vec2::new(0.0, 980.0),  // pixels/s² (2D game gravity)
+            broadphase: SpatialHash::new(64.0),
+            contacts:   BmVec::new(),
+            _next_id:   1,
+        }
+    }
+
+    pub fn add_body(self: &var PhysicsWorld2D, body: Body2D) -> u32 {
+        let id = body.id;
+        self.bodies.push(body);
+        id
+    }
+
+    pub fn remove_body(self: &var PhysicsWorld2D, id: u32) {
+        var i: usize = 0;
+        while i < self.bodies.len() {
+            if self.bodies[i].id == id { self.bodies.swap_remove(i); return; }
+            i += 1;
+        }
+    }
+
+    pub fn next_id(self: &var PhysicsWorld2D) -> u32 {
+        let id = self._next_id;
+        self._next_id += 1;
+        id
+    }
+
+    #[sicko]
+    pub fn step(self: &var PhysicsWorld2D, dt: f32) {
+        // 1. Integrate forces → velocity
+        var i: usize = 0;
+        while i < self.bodies.len() {
+            let b = &var self.bodies[i];
+            match b.body_type {
+                BodyType::Dynamic => {
+                    let g_force   = self.gravity.scale(b.mass);
+                    let net_force = b._force.add(g_force);
+                    b.vel = b.vel.add(net_force.scale(b.inv_mass * dt));
+                    if !b.lock_rotation {
+                        b.omega += b._torque * dt;
+                    }
+                }
+                _ => {}
+            }
+            b.clear_forces();
+            i += 1;
+        }
+
+        // 2. Broadphase
+        self.broadphase.clear();
+        var j: usize = 0;
+        while j < self.bodies.len() {
+            let b = &self.bodies[j];
+            if b.active { self.broadphase.insert(b.id, b.aabb()); }
+            j += 1;
+        }
+
+        // 3. Narrow-phase & resolve
+        self.contacts.clear();
+        var candidates: BmVec<u32> = BmVec::new();
+        var k: usize = 0;
+        while k < self.bodies.len() {
+            let b = &self.bodies[k];
+            if !b.active { k += 1; continue; }
+            self.broadphase.query_aabb(b.aabb(), &var candidates);
+            var m: usize = 0;
+            while m < candidates.len() {
+                let other_id = candidates[m];
+                if other_id <= b.id { m += 1; continue; }  // avoid duplicates
+                match self.find_body(other_id) {
+                    Some(other_idx) => {
+                        let other = &self.bodies[other_idx];
+                        match test_collision(b, other) {
+                            Some(contact) => { self.contacts.push(contact); }
+                            None => {}
+                        }
+                    }
+                    None => {}
+                }
+                m += 1;
+            }
+            k += 1;
+        }
+
+        // 4. Impulse resolution
+        var iter: u32 = 0;
+        while iter < 8 {
+            var ci: usize = 0;
+            while ci < self.contacts.len() {
+                self.resolve_contact(ci, dt);
+                ci += 1;
+            }
+            iter += 1;
+        }
+
+        // 5. Integrate position
+        var p: usize = 0;
+        while p < self.bodies.len() {
+            let b = &var self.bodies[p];
+            match b.body_type {
+                BodyType::Dynamic | BodyType::Kinematic => {
+                    b.pos   = b.pos.add(b.vel.scale(dt));
+                    if !b.lock_rotation { b.angle += b.omega * dt; }
+                }
+                _ => {}
+            }
+            p += 1;
+        }
+    }
+
+    fn resolve_contact(self: &var PhysicsWorld2D, ci: usize, dt: f32) {
+        let c = &self.contacts[ci];
+        var ai: usize = 0;
+        var bi: usize = 0;
+        match self.find_body(c.body_a) { Some(i) => { ai = i; } None => { return; } }
+        match self.find_body(c.body_b) { Some(i) => { bi = i; } None => { return; } }
+
+        var ra: f32 = 0.0;
+        var rb: f32 = 0.0;
+        unsafe {
+            ra = (*self.bodies.as_ptr().add(ai)).inv_mass;
+            rb = (*self.bodies.as_ptr().add(bi)).inv_mass;
+        }
+
+        let rel_vel = unsafe {
+            let a = &self.bodies[ai];
+            let b = &self.bodies[bi];
+            b.vel.sub(a.vel)
+        };
+        let vel_along = rel_vel.dot(c.normal);
+        if vel_along > 0.0 { return; }  // separating
+
+        let e = {
+            let a = &self.bodies[ai];
+            let b = &self.bodies[bi];
+            a.restitution.min(b.restitution)
+        };
+
+        let j_scalar = -(1.0 + e) * vel_along / (ra + rb + EPSILON);
+        let j = c.normal.scale(j_scalar);
+
+        unsafe {
+            let a = &var *self.bodies.as_mut_ptr().add(ai);
+            let b = &var *self.bodies.as_mut_ptr().add(bi);
+            match a.body_type { BodyType::Dynamic => { a.vel = a.vel.sub(j.scale(a.inv_mass)); } _ => {} }
+            match b.body_type { BodyType::Dynamic => { b.vel = b.vel.add(j.scale(b.inv_mass)); } _ => {} }
+        }
+
+        // Positional correction (Baumgarte)
+        let slop  = 0.01f32;
+        let frac  = 0.4f32;
+        let depth = c.depth;
+        if depth > slop {
+            let corr = c.normal.scale(frac * (depth - slop) / (ra + rb + EPSILON));
+            unsafe {
+                let a = &var *self.bodies.as_mut_ptr().add(ai);
+                let b = &var *self.bodies.as_mut_ptr().add(bi);
+                match a.body_type { BodyType::Dynamic => { a.pos = a.pos.sub(corr.scale(a.inv_mass)); } _ => {} }
+                match b.body_type { BodyType::Dynamic => { b.pos = b.pos.add(corr.scale(b.inv_mass)); } _ => {} }
+            }
+        }
+    }
+
+    fn find_body(self: &PhysicsWorld2D, id: u32) -> Option<usize> {
+        var i: usize = 0;
+        while i < self.bodies.len() {
+            if self.bodies[i].id == id { return ?i; }
+            i += 1;
+        }
+        None
+    }
+
+    pub fn body_count(self: &PhysicsWorld2D) -> usize { self.bodies.len() }
+    pub fn contact_count(self: &PhysicsWorld2D) -> usize { self.contacts.len() }
+}
+
+trait F32Min { fn min(self, rhs: f32) -> f32; }
+impl F32Min for f32 { fn min(self, rhs: f32) -> f32 { if self < rhs { self } else { rhs } } }

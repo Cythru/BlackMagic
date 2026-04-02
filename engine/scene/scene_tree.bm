@@ -1,0 +1,250 @@
+/// BlackMagic Engine — scene/scene_tree.bm
+///
+/// SceneTree — the global game loop controller.
+/// Owns the root node, dispatches per-frame process/physics callbacks,
+/// manages groups, pausing, scene changes, and the deferred signal bus.
+///
+/// One SceneTree per application; accessed as a singleton via `get_tree()`.
+
+use engine::core::signal::{ Signal, SignalBus, SigProcess, SigPhysTick, SigGameEvent };
+use engine::scene::node::{ Node };
+use bm::collections::{ HashMap, Vec as BmVec };
+use bm::sync::AtomicBool;
+
+// ─── SceneTree ─────────────────────────────────────────────────────────────
+
+pub struct SceneTree {
+    pub root:         *var Node,
+    pub paused:       bool,
+    pub quit_requested: bool,
+
+    // Frame timing
+    pub frame:         u64,
+    pub time_scale:    f32,
+    pub fixed_fps:     f32,   // physics steps per second (default 60)
+
+    // Groups: group_name → [node_ptr, ...]
+    groups: HashMap<str, BmVec<*var Node>>,
+
+    // Deferred signal bus
+    pub bus: SignalBus,
+
+    // Signals
+    pub sig_process_frame: Signal<SigProcess>,
+    pub sig_physics_frame: Signal<SigPhysTick>,
+    pub sig_tree_changed:  Signal<SigGameEvent>,
+    pub sig_node_added:    Signal<SigGameEvent>,
+    pub sig_node_removed:  Signal<SigGameEvent>,
+
+    // Scene transition queue
+    pending_scene: str,  // path of next scene to load ("" = no change)
+}
+
+impl SceneTree {
+    pub fn new(root: *var Node) -> SceneTree {
+        SceneTree {
+            root,
+            paused:           false,
+            quit_requested:   false,
+            frame:            0,
+            time_scale:       1.0,
+            fixed_fps:        60.0,
+            groups:           HashMap::new(),
+            bus:              SignalBus::new(),
+            sig_process_frame: Signal::new(),
+            sig_physics_frame: Signal::new(),
+            sig_tree_changed:  Signal::new(),
+            sig_node_added:    Signal::new(),
+            sig_node_removed:  Signal::new(),
+            pending_scene:    "",
+        }
+    }
+
+    // ── Frame dispatch ────────────────────────────────────────────────────
+
+    /// Called once per render frame by the platform layer.
+    /// `delta` is wall-clock seconds since last frame.
+    pub fn process_frame(self: &var SceneTree, delta: f32) {
+        let scaled = delta * self.time_scale;
+        self.frame += 1;
+
+        // Dispatch process to all nodes depth-first
+        if self.root != null {
+            SceneTree::dispatch_process(self.root, scaled, self.paused);
+        }
+
+        // Emit global signal
+        self.sig_process_frame.emit(SigProcess { delta: scaled });
+
+        // Flush deferred signals
+        self.bus.flush();
+
+        // Handle scene change
+        if self.pending_scene != "" {
+            self.do_scene_change();
+        }
+    }
+
+    /// Called at a fixed rate (default 60 Hz) for physics.
+    pub fn physics_tick(self: &var SceneTree, delta: f32) {
+        if self.paused { return; }
+        if self.root != null {
+            SceneTree::dispatch_physics(self.root, delta);
+        }
+        self.sig_physics_frame.emit(SigPhysTick { delta });
+    }
+
+    fn dispatch_process(n: *var Node, delta: f32, tree_paused: bool) {
+        unsafe {
+            let node = &var *n;
+            let active = match node.process_mode {
+                ProcessMode::Disabled   => false,
+                ProcessMode::Always     => true,
+                ProcessMode::Pausable   => !tree_paused,
+                ProcessMode::WhenPaused => tree_paused,
+                ProcessMode::Inherit    => !tree_paused,
+            };
+            if active {
+                (node.on_process)(n, delta);
+                node.sig_process.emit(SigProcess { delta });
+            }
+            var i: usize = 0;
+            while i < node.children.len() {
+                SceneTree::dispatch_process(node.children[i], delta, tree_paused);
+                i += 1;
+            }
+        }
+    }
+
+    fn dispatch_physics(n: *var Node, delta: f32) {
+        unsafe {
+            let node = &var *n;
+            let active = match node.process_mode {
+                ProcessMode::Disabled   => false,
+                ProcessMode::Always | ProcessMode::Pausable | ProcessMode::Inherit => true,
+                ProcessMode::WhenPaused => false,
+            };
+            if active {
+                (node.on_physics_process)(n, delta);
+                node.sig_phys_tick.emit(SigPhysTick { delta });
+            }
+            var i: usize = 0;
+            while i < node.children.len() {
+                SceneTree::dispatch_physics(node.children[i], delta);
+                i += 1;
+            }
+        }
+    }
+
+    // ── Groups ────────────────────────────────────────────────────────────
+
+    pub fn add_to_group(self: &var SceneTree, group: str, node: *var Node) {
+        match self.groups.get_mut(group) {
+            Some(list) => { list.push(node); }
+            None => {
+                var v = BmVec::new();
+                v.push(node);
+                self.groups.insert(group, v);
+            }
+        }
+    }
+
+    pub fn remove_from_group(self: &var SceneTree, group: str, node: *var Node) {
+        match self.groups.get_mut(group) {
+            Some(list) => {
+                var i: usize = 0;
+                while i < list.len() {
+                    if list[i] == node { list.swap_remove(i); return; }
+                    i += 1;
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Call a method name on every node in a group.
+    /// (Dispatch via notification code — avoids vtable, nodes opt in via on_notification)
+    pub fn call_group(self: &SceneTree, group: str, notif: u32) {
+        match self.groups.get(group) {
+            Some(list) => {
+                var i: usize = 0;
+                while i < list.len() {
+                    let n = list[i];
+                    unsafe { ((*n).on_notification)(n, notif); }
+                    i += 1;
+                }
+            }
+            None => {}
+        }
+    }
+
+    pub fn get_nodes_in_group(self: &SceneTree, group: str) -> &BmVec<*var Node> {
+        match self.groups.get(group) {
+            Some(list) => list,
+            None => &EMPTY_NODE_LIST,
+        }
+    }
+
+    // ── Pausing ───────────────────────────────────────────────────────────
+
+    pub fn pause(self: &var SceneTree) {
+        if !self.paused {
+            self.paused = true;
+            self.call_group("__all__", NOTIF_PAUSED);
+        }
+    }
+
+    pub fn unpause(self: &var SceneTree) {
+        if self.paused {
+            self.paused = false;
+            self.call_group("__all__", NOTIF_UNPAUSED);
+        }
+    }
+
+    // ── Scene management ─────────────────────────────────────────────────
+
+    /// Queue a scene transition. Takes effect at end of current frame.
+    pub fn change_scene(self: &var SceneTree, path: str) {
+        self.pending_scene = path;
+    }
+
+    pub fn quit(self: &var SceneTree) {
+        self.quit_requested = true;
+    }
+
+    fn do_scene_change(self: &var SceneTree) {
+        // Platform layer handles actual loading; we just signal intent
+        unsafe { bm::platform::request_scene_change(self.pending_scene); }
+        self.pending_scene = "";
+    }
+
+    // ── Queries ───────────────────────────────────────────────────────────
+
+    pub fn get_node_count(self: &SceneTree) -> usize {
+        if self.root == null { 0 }
+        else { count_nodes(self.root) }
+    }
+
+    pub fn current_fps(self: &SceneTree) -> f32 {
+        // Platform fills this in
+        unsafe { bm::platform::current_fps() }
+    }
+}
+
+fn count_nodes(n: *var Node) -> usize {
+    unsafe {
+        var sum: usize = 1;
+        var i: usize = 0;
+        while i < (*n).children.len() {
+            sum += count_nodes((*n).children[i]);
+            i += 1;
+        }
+        sum
+    }
+}
+
+// Constants imported from node.bm
+use engine::scene::node::{ NOTIF_PAUSED, NOTIF_UNPAUSED, ProcessMode };
+
+// Static empty list for group queries on unknown groups
+const EMPTY_NODE_LIST: BmVec<*var Node> = comptime { BmVec::new() };

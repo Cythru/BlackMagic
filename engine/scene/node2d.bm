@@ -1,0 +1,152 @@
+/// BlackMagic Engine — scene/node2d.bm
+///
+/// Node2D — 2D spatial node with Transform2D, visibility, z-index.
+/// Extends Node with 2D positioning, rotation, scale, and z-index layering.
+
+use engine::core::math::{ Vec2, Transform2D };
+use engine::scene::node::{ Node };
+
+pub struct Node2D {
+    pub base: Node,
+
+    // Local transform
+    pub position: Vec2,
+    pub rotation: f32,    // radians
+    pub scale:    Vec2,
+
+    // Rendering
+    pub z_index:  i32,
+    pub z_as_relative: bool,  // if true, z_index adds to parent's z
+
+    // Cached world transform (invalidated on any change)
+    _world_xform: Transform2D,
+    _xform_dirty: bool,
+}
+
+impl Node2D {
+    pub fn new(name: str) -> Node2D {
+        Node2D {
+            base:          Node::new(name),
+            position:      Vec2::zero(),
+            rotation:      0.0,
+            scale:         Vec2::one(),
+            z_index:       0,
+            z_as_relative: true,
+            _world_xform:  Transform2D::identity(),
+            _xform_dirty:  true,
+        }
+    }
+
+    // ── Transform helpers ─────────────────────────────────────────────────
+
+    pub fn local_transform(self: &Node2D) -> Transform2D {
+        var t = Transform2D::from_angle_origin(self.rotation, self.position);
+        // Apply scale to basis columns
+        t.x = t.x.scale(self.scale.x);
+        t.y = t.y.scale(self.scale.y);
+        t
+    }
+
+    pub fn world_transform(self: &var Node2D) -> Transform2D {
+        if self._xform_dirty {
+            let local = self.local_transform();
+            let parent = self.base.parent;
+            if parent == null {
+                self._world_xform = local;
+            } else {
+                // Parent might be a Node2D — try to get its world transform
+                // (Runtime type dispatch via a convention: first field of Node2D is base:Node)
+                let pw = unsafe { node2d_world_xform(parent as *var Node2D) };
+                // Compose: world = parent_world * local
+                self._world_xform = compose_transforms(pw, local);
+            }
+            self._xform_dirty = false;
+        }
+        self._world_xform
+    }
+
+    pub fn global_position(self: &var Node2D) -> Vec2 {
+        self.world_transform().origin
+    }
+
+    pub fn set_global_position(self: &var Node2D, pos: Vec2) {
+        let parent = self.base.parent;
+        if parent == null {
+            self.position = pos;
+        } else {
+            let pw = unsafe { node2d_world_xform(parent as *var Node2D) };
+            self.position = pw.inverse().xform(pos);
+        }
+        self._xform_dirty = true;
+    }
+
+    pub fn global_rotation(self: &var Node2D) -> f32 {
+        let xf = self.world_transform();
+        // Extract rotation from x-basis column
+        atan2(xf.x.y, xf.x.x)
+    }
+
+    pub fn set_position(self: &var Node2D, p: Vec2) {
+        self.position = p;
+        self._xform_dirty = true;
+    }
+
+    pub fn set_rotation(self: &var Node2D, r: f32) {
+        self.rotation = r;
+        self._xform_dirty = true;
+    }
+
+    pub fn set_scale(self: &var Node2D, s: Vec2) {
+        self.scale = s;
+        self._xform_dirty = true;
+    }
+
+    pub fn translate(self: &var Node2D, delta: Vec2) {
+        self.position = self.position.add(delta);
+        self._xform_dirty = true;
+    }
+
+    pub fn rotate(self: &var Node2D, angle: f32) {
+        self.rotation += angle;
+        self._xform_dirty = true;
+    }
+
+    pub fn look_at(self: &var Node2D, target: Vec2) {
+        let dir = target.sub(self.global_position(self));
+        self.rotation = dir.angle();
+        self._xform_dirty = true;
+    }
+
+    // ── Coordinate conversion ─────────────────────────────────────────────
+
+    pub fn to_local(self: &var Node2D, global_pos: Vec2) -> Vec2 {
+        self.world_transform().inverse().xform(global_pos)
+    }
+
+    pub fn to_global(self: &var Node2D, local_pos: Vec2) -> Vec2 {
+        self.world_transform().xform(local_pos)
+    }
+}
+
+// ─── Utility (internal) ────────────────────────────────────────────────────
+
+fn compose_transforms(parent: Transform2D, local: Transform2D) -> Transform2D {
+    // Result: apply local in parent's space
+    // origin = parent.xform(local.origin)
+    // x-col  = parent.xform(local.x) - parent.origin  (rotate+scale only)
+    let ox = parent.xform(local.origin);
+    let bx = Vec2 {
+        x: parent.x.x * local.x.x + parent.y.x * local.x.y,
+        y: parent.x.y * local.x.x + parent.y.y * local.x.y,
+    };
+    let by = Vec2 {
+        x: parent.x.x * local.y.x + parent.y.x * local.y.y,
+        y: parent.x.y * local.y.x + parent.y.y * local.y.y,
+    };
+    Transform2D { x: bx, y: by, origin: ox }
+}
+
+// Runtime helper: assumes layout-compatible Node2D (base Node is first field)
+extern {
+    fn node2d_world_xform(n: *var Node2D) -> Transform2D;
+}

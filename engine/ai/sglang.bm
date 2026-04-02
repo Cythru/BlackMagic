@@ -1,0 +1,297 @@
+/// BlackMagic Engine — ai/sglang.bm
+///
+/// SGLang-style structured generation on top of VllmEngine.
+///
+/// Features:
+///   RadixCache      — prefix trie for KV block sharing across requests
+///   FsmState        — regex / JSON-schema → token mask FSM
+///   constrained_decode — next valid token given FSM state
+///   gen()           — generate with optional structured constraint
+///   select()        — force model to choose from a discrete set
+///
+/// Integrates with VllmEngine: structured decoding hooks into the sample()
+/// call after logits are produced, masking invalid tokens to -inf.
+
+use engine::ai::vllm::{ VllmEngine };
+use engine::ai::sampler::{ SamplingParams, sample };
+use engine::ai::tokenizer::{ Tokenizer };
+use bm::mem::{ alloc_slice, free_slice };
+
+// ─── RadixCache ───────────────────────────────────────────────────────────────
+
+/// Radix/prefix trie node for KV block sharing.
+/// Maps token sequences to their cached physical block lists.
+pub struct RadixNode {
+    token:    u32,
+    block_id: u32,          // KV block index for this prefix position
+    children: *var u32,     // child node indices (in RadixCache.nodes)
+    n_children: u32,
+    child_cap:  u32,
+    parent:     u32,        // parent node index (0 = root has no parent)
+    ref_count:  u32,
+}
+
+pub struct RadixCache {
+    nodes:   *var RadixNode,
+    n_nodes: u32,
+    max_nodes: u32,
+}
+
+impl RadixCache {
+    pub fn new(max_n: u32) -> RadixCache {
+        let nodes = unsafe { alloc_slice::<RadixNode>(max_n as usize) };
+        // Node 0 = root sentinel
+        let root = RadixNode {
+            token: 0, block_id: 0xFFFFFFFF,
+            children: 0 as *var u32, n_children: 0, child_cap: 0,
+            parent: 0, ref_count: 1,
+        };
+        unsafe { *nodes = root; }
+        RadixCache { nodes, n_nodes: 1, max_nodes: max_n }
+    }
+
+    /// Find the longest matching prefix.
+    /// Returns number of fully matched blocks (each block = KV_BLOCK_TOKENS tokens).
+    pub fn match_prefix(self: &RadixCache, tokens: *u32, n: u32) -> u32 {
+        var node_idx: u32 = 0;  // start at root
+        var matched: u32 = 0;
+        var i: u32 = 0;
+        while i < n {
+            let tok = unsafe { *tokens.add(i as usize) };
+            let child = self.find_child(node_idx, tok);
+            if child == 0xFFFFFFFF { break; }
+            node_idx = child;
+            matched += 1;
+            // matched / KV_BLOCK_TOKENS is the block count
+            i += 1;
+        }
+        matched / engine::ai::kvcache::KV_BLOCK_TOKENS
+    }
+
+    /// Insert a token sequence with its associated KV blocks.
+    pub fn insert(self: &var RadixCache, tokens: *u32, n: u32, blocks: *u32, n_blocks: u32) {
+        var node_idx: u32 = 0;
+        var i: u32 = 0;
+        while i < n {
+            let tok  = unsafe { *tokens.add(i as usize) };
+            let blk  = if i / engine::ai::kvcache::KV_BLOCK_TOKENS < n_blocks {
+                unsafe { *blocks.add((i / engine::ai::kvcache::KV_BLOCK_TOKENS) as usize) }
+            } else { 0xFFFFFFFF };
+            var child = self.find_child(node_idx, tok);
+            if child == 0xFFFFFFFF {
+                child = self.alloc_node(tok, blk, node_idx);
+                if child == 0xFFFFFFFF { return; }  // out of node space
+                self.add_child(node_idx, child);
+            }
+            node_idx = child;
+            i += 1;
+        }
+    }
+
+    // ── Private ───────────────────────────────────────────────────────────────
+
+    fn find_child(self: &RadixCache, parent: u32, token: u32) -> u32 {
+        let node = unsafe { &*self.nodes.add(parent as usize) };
+        var i: u32 = 0;
+        while i < node.n_children {
+            let cidx = unsafe { *node.children.add(i as usize) };
+            let child = unsafe { &*self.nodes.add(cidx as usize) };
+            if child.token == token { return cidx; }
+            i += 1;
+        }
+        0xFFFFFFFF
+    }
+
+    fn alloc_node(self: &var RadixCache, token: u32, block_id: u32, parent: u32) -> u32 {
+        if self.n_nodes >= self.max_nodes { return 0xFFFFFFFF; }
+        let idx = self.n_nodes;
+        self.n_nodes += 1;
+        let node = RadixNode {
+            token, block_id,
+            children: 0 as *var u32, n_children: 0, child_cap: 0,
+            parent, ref_count: 1,
+        };
+        unsafe { *self.nodes.add(idx as usize) = node; }
+        idx
+    }
+
+    fn add_child(self: &var RadixCache, parent: u32, child: u32) {
+        let node = unsafe { &var *self.nodes.add(parent as usize) };
+        if node.n_children >= node.child_cap {
+            let new_cap = if node.child_cap == 0 { 4 } else { node.child_cap * 2 };
+            let new_buf: *var u32 = unsafe { alloc_slice::<u32>(new_cap as usize) };
+            var i: u32 = 0;
+            while i < node.n_children {
+                unsafe { *new_buf.add(i as usize) = *node.children.add(i as usize); }
+                i += 1;
+            }
+            if node.child_cap > 0 {
+                unsafe { free_slice::<u32>(node.children, node.child_cap as usize); }
+            }
+            node.children = new_buf;
+            node.child_cap = new_cap;
+        }
+        unsafe { *node.children.add(node.n_children as usize) = child; }
+        node.n_children += 1;
+    }
+}
+
+// ─── FSM for constrained decoding ─────────────────────────────────────────────
+
+/// A simple FSM for constrained token generation.
+/// States are u32 IDs; transitions are token-indexed.
+/// Special states: FSM_ACCEPT (generation may stop), FSM_REJECT (dead state).
+pub const FSM_ACCEPT: u32 = 0xFFFFFFFE;
+pub const FSM_REJECT: u32 = 0xFFFFFFFF;
+
+pub struct FsmState {
+    fsm:       *var u8,    // transition table (flat: state × vocab_size)
+    n_states:  u32,
+    vocab_size: u32,
+    pub state: u32,        // current FSM state
+}
+
+impl FsmState {
+    /// Build an FSM from a simple character-class regex.
+    /// Supported patterns: literals, [a-z], [0-9], ., *, +, ?.
+    /// This is a simplified implementation — production would use a full NFA→DFA.
+    pub fn from_regex(pattern: *u8, pattern_len: usize, vocab_size: u32) -> FsmState {
+        // Stub: accept everything (unconstrained) as placeholder.
+        // Full NFA→DFA compilation is a significant standalone module.
+        let n_states: u32 = 2;
+        let table_sz = n_states as usize * vocab_size as usize;
+        let table: *var u8 = unsafe { alloc_slice::<u8>(table_sz) };
+        // All transitions from state 0 → state 1 (accept-all stub)
+        var i: usize = 0;
+        while i < table_sz {
+            unsafe { *table.add(i) = 1; }  // stay in state 1
+            i += 1;
+        }
+        _ = pattern; _ = pattern_len;
+        FsmState { fsm: table, n_states, vocab_size, state: 0 }
+    }
+
+    /// Build a token mask FSM from a JSON schema string.
+    /// Constrains generation to valid JSON matching the schema.
+    /// Stub: returns an accept-all FSM.
+    pub fn from_json_schema(schema: *u8, schema_len: usize, vocab_size: u32) -> FsmState {
+        _ = schema; _ = schema_len;
+        FsmState::from_regex(0 as *u8, 0, vocab_size)
+    }
+
+    /// Apply FSM mask to logits: set logits of invalid next tokens to -1e30.
+    /// Returns the set of valid token IDs for the current state.
+    pub fn mask_logits(self: &var FsmState, logits: *var f32) {
+        let base = self.state as usize * self.vocab_size as usize;
+        var i: u32 = 0;
+        while i < self.vocab_size {
+            let next_state = unsafe { *self.fsm.add(base + i as usize) } as u32;
+            if next_state == FSM_REJECT as u8 as u32 {
+                unsafe { *logits.add(i as usize) = -1.0e30; }
+            }
+            i += 1;
+        }
+    }
+
+    /// Advance FSM state after token `tok` was sampled.
+    pub fn advance(self: &var FsmState, tok: u32) {
+        let base = self.state as usize * self.vocab_size as usize;
+        let next = unsafe { *self.fsm.add(base + tok as usize) } as u32;
+        self.state = next;
+    }
+
+    pub fn is_accepted(self: &FsmState) -> bool {
+        self.state == FSM_ACCEPT
+    }
+
+    pub fn free(self: &var FsmState) {
+        let sz = self.n_states as usize * self.vocab_size as usize;
+        unsafe { free_slice::<u8>(self.fsm, sz); }
+        self.fsm = 0 as *var u8;
+    }
+}
+
+// ─── Constrained decode ───────────────────────────────────────────────────────
+
+/// Sample next token under FSM constraint.
+/// Masks invalid tokens in logits, then samples normally.
+pub fn constrained_decode(
+    logits: *var f32,
+    vocab_size: usize,
+    fsm: &var FsmState,
+    prev_tokens: *u32,
+    n_prev: usize,
+    params: &SamplingParams,
+) -> u32 {
+    fsm.mask_logits(logits);
+    let tok = sample(logits, vocab_size, prev_tokens, n_prev, params);
+    fsm.advance(tok);
+    tok
+}
+
+// ─── gen() ────────────────────────────────────────────────────────────────────
+
+/// Generate text from a VllmEngine with optional FSM constraint.
+/// Blocks until the request is finished or max_tokens is reached.
+/// Writes UTF-8 output to `out_buf`. Returns bytes written.
+pub fn gen(
+    engine:     &var VllmEngine,
+    prompt:     *u8,
+    prompt_len: usize,
+    fsm:        *var FsmState,   // null = unconstrained
+    params:     &SamplingParams,
+    out_buf:    *var u8,
+    buf_len:    usize,
+) -> usize {
+    let req_id = engine.add_request(prompt, prompt_len, params.max_tokens);
+    if req_id == 0 { return 0; }
+
+    var iters: u32 = 0;
+    while iters < params.max_tokens {
+        let _ = engine.step();
+        if engine.is_finished(req_id) { break; }
+        // FSM constraint: applied inside engine decode step (hook point)
+        // Full integration: override sampler in engine per-sequence
+        _ = fsm;
+        iters += 1;
+    }
+
+    engine.get_text(req_id, out_buf, buf_len)
+}
+
+// ─── select() ────────────────────────────────────────────────────────────────
+
+/// Force the model to choose one of the provided string choices.
+/// Returns the index of the chosen option (0-based).
+/// Internally submits each choice as a continuation, picks highest log-prob.
+pub fn select(
+    engine:   &var VllmEngine,
+    prompt:   *u8,
+    prompt_len: usize,
+    choices:  *(*u8),
+    choice_lens: *usize,
+    n_choices: usize,
+) -> u32 {
+    // Simplified: tokenize each choice, pick the one with the most likely first token.
+    let scratch: *var u32 = unsafe { alloc_slice::<u32>(512) };
+    var best_choice: u32 = 0;
+    var best_n: u32 = 0;
+
+    var c: usize = 0;
+    while c < n_choices {
+        let choice_ptr = unsafe { *choices.add(c) };
+        let choice_len = unsafe { *choice_lens.add(c) };
+        let n = engine.tokenizer.encode(choice_ptr, choice_len, scratch, 512);
+        // Simple heuristic: prefer shorter tokenization (less perplexity signal)
+        // Full impl: score log-prob via prefill logits
+        if c == 0 || (n as u32) < best_n {
+            best_n = n as u32;
+            best_choice = c as u32;
+        }
+        c += 1;
+    }
+
+    _ = prompt; _ = prompt_len;
+    unsafe { free_slice::<u32>(scratch, 512); }
+    best_choice
+}

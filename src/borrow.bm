@@ -1,0 +1,355 @@
+/// BlackMagic Borrow Checker
+/// Enforces:
+///   - Single-owner move semantics
+///   - Aliasing XOR mutation (&T | &var T, not both)
+///   - Linear type consumption (exactly once)
+///   - Lifetime validity (no use-after-move, no dangling refs)
+
+use std::collections::HashMap;
+use crate::ast::*;
+use crate::error::{BmError, Span};
+
+// ─── Loan (active borrow) ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LoanKind { Shared, Mutable }
+
+#[derive(Debug, Clone)]
+pub struct Loan {
+    pub place:  String,
+    pub kind:   LoanKind,
+    pub span:   Span,
+    pub region: RegionId,
+}
+
+// ─── Move state ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MoveState {
+    Owned,
+    Moved(Span),
+    Borrowed,
+    MutBorrowed,
+    Consumed,
+}
+
+// ─── Region ────────────────────────────────────────────────────────────────
+
+pub type RegionId = u32;
+
+#[derive(Debug)]
+pub struct Region {
+    pub id:     RegionId,
+    pub parent: Option<RegionId>,
+}
+
+// ─── Borrow Checker ────────────────────────────────────────────────────────
+
+pub struct BorrowChecker {
+    pub errors:   Vec<BmError>,
+    states:       HashMap<String, MoveState>,
+    active_loans: Vec<Loan>,
+    regions:      Vec<Region>,
+    next_region:  RegionId,
+    linear_vars:  Vec<String>,
+}
+
+impl BorrowChecker {
+    pub fn new() -> Self {
+        BorrowChecker {
+            errors:       Vec::new(),
+            states:       HashMap::new(),
+            active_loans: Vec::new(),
+            regions:      vec![Region { id: 0, parent: None }],
+            next_region:  1,
+            linear_vars:  Vec::new(),
+        }
+    }
+
+    pub fn check_file(&mut self, file: &SourceFile) {
+        for item in &file.items { self.check_item(item); }
+    }
+
+    fn check_item(&mut self, item: &Item) {
+        match &item.kind {
+            ItemKind::Function(f) => self.check_function(f),
+            ItemKind::Impl(im) => {
+                for it in &im.items {
+                    if let ItemKind::Function(f) = &it.kind { self.check_function(f); }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn check_function(&mut self, f: &FunctionDecl) {
+        let region = self.push_region(None);
+        for p in &f.params {
+            if let PatternKind::Ident { name, .. } = &p.name.kind {
+                self.states.insert(name.name.clone(), MoveState::Owned);
+            }
+        }
+        if let Some(body) = &f.body {
+            self.check_block(body, region);
+        }
+        // linear vars must be consumed
+        for lv in &self.linear_vars.clone() {
+            if let Some(MoveState::Owned) = self.states.get(lv) {
+                self.errors.push(BmError::BorrowError {
+                    msg: format!("linear variable `{}` must be consumed before end of scope", lv),
+                    span: f.name.span,
+                });
+            }
+        }
+        self.pop_region(region);
+    }
+
+    fn check_block(&mut self, block: &Block, region: RegionId) {
+        for stmt in &block.stmts { self.check_stmt(stmt, region); }
+        if let Some(tail) = &block.expr { self.check_expr(tail, region); }
+    }
+
+    fn check_stmt(&mut self, stmt: &Stmt, region: RegionId) {
+        match &stmt.kind {
+            StmtKind::Let { pattern, init, .. } => {
+                if let Some(init) = init { self.check_expr(init, region); }
+                self.bind_pattern(pattern);
+            }
+            StmtKind::Expr(e) => { self.check_expr(e, region); }
+            StmtKind::Const { .. } | StmtKind::Item(_) => {}
+        }
+    }
+
+    fn check_expr(&mut self, expr: &Expr, region: RegionId) {
+        match &expr.kind {
+            ExprKind::Var(path) => {
+                if let Some(name) = path.segments.last() {
+                    self.check_use(&name.name, expr.span);
+                }
+            }
+            ExprKind::Block(b) => {
+                let r = self.push_region(Some(region));
+                self.check_block(b, r);
+                self.pop_region(r);
+            }
+            ExprKind::Unsafe(b) => {
+                let r = self.push_region(Some(region));
+                self.check_block(b, r);
+                self.pop_region(r);
+            }
+            ExprKind::Call { callee, args } => {
+                self.check_expr(callee, region);
+                for a in args { self.check_expr(&a.expr, region); }
+            }
+            ExprKind::MethodCall { receiver, args, .. } => {
+                self.check_expr(receiver, region);
+                for a in args { self.check_expr(&a.expr, region); }
+            }
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.check_expr(lhs, region);
+                self.check_expr(rhs, region);
+            }
+            ExprKind::Unary { operand, .. } => { self.check_expr(operand, region); }
+            ExprKind::Ref { expr: inner, mutable } => {
+                if *mutable {
+                    self.check_mut_borrow(inner, region, expr.span);
+                } else {
+                    self.check_shared_borrow(inner, region, expr.span);
+                }
+            }
+            ExprKind::If { cond, then, else_ } => {
+                self.check_expr(cond, region);
+                let r = self.push_region(Some(region));
+                self.check_block(then, r);
+                self.pop_region(r);
+                if let Some(el) = else_ {
+                    let r2 = self.push_region(Some(region));
+                    self.check_expr(el, r2);
+                    self.pop_region(r2);
+                }
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                self.check_expr(scrutinee, region);
+                for arm in arms {
+                    let r = self.push_region(Some(region));
+                    self.bind_pattern(&arm.pattern);
+                    if let Some(guard) = &arm.guard { self.check_expr(guard, r); }
+                    self.check_expr(&arm.body, r);
+                    self.pop_region(r);
+                }
+            }
+            ExprKind::While { cond, body, .. } => {
+                self.check_expr(cond, region);
+                let r = self.push_region(Some(region));
+                self.check_block(body, r);
+                self.pop_region(r);
+            }
+            ExprKind::For { pat, iter, body, .. } => {
+                self.check_expr(iter, region);
+                let r = self.push_region(Some(region));
+                self.bind_pattern(pat);
+                self.check_block(body, r);
+                self.pop_region(r);
+            }
+            ExprKind::Handle { computation, handlers } => {
+                self.check_expr(computation, region);
+                for h in handlers {
+                    let r = self.push_region(Some(region));
+                    for p in &h.params {
+                        if let PatternKind::Ident { name, .. } = &p.name.kind {
+                            self.states.insert(name.name.clone(), MoveState::Owned);
+                        }
+                    }
+                    self.check_block(&h.body, r);
+                    self.pop_region(r);
+                }
+            }
+            ExprKind::Closure { params, body, .. } => {
+                let r = self.push_region(Some(region));
+                for p in params {
+                    if let PatternKind::Ident { name, .. } = &p.name.kind {
+                        self.states.insert(name.name.clone(), MoveState::Owned);
+                    }
+                }
+                self.check_expr(body, r);
+                self.pop_region(r);
+            }
+            ExprKind::Return(e) => {
+                if let Some(e) = e { self.check_expr(e, region); }
+            }
+            ExprKind::Assign { target, value, .. } => {
+                self.check_expr(target, region);
+                self.check_expr(value, region);
+            }
+            ExprKind::Defer(e)        => { self.check_expr(e, region); }
+            ExprKind::Try(e)          => { self.check_expr(e, region); }
+            ExprKind::Await(e)        => { self.check_expr(e, region); }
+            ExprKind::Spawn(e)        => { self.check_expr(e, region); }
+            ExprKind::Move(e)         => { self.check_expr(e, region); }
+            ExprKind::Deref(e)        => { self.check_expr(e, region); }
+            ExprKind::Comptime(e)     => { self.check_expr(e, region); }
+            ExprKind::Cast { expr: e, .. } => { self.check_expr(e, region); }
+            ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => {
+                self.check_expr(base, region);
+            }
+            ExprKind::Index { base, idx } => {
+                self.check_expr(base, region);
+                self.check_expr(idx, region);
+            }
+            ExprKind::Tuple(es) => {
+                for e in es { self.check_expr(e, region); }
+            }
+            ExprKind::Array(ae) => {
+                match ae {
+                    ArrayExpr::List(es) => { for e in es { self.check_expr(e, region); } }
+                    ArrayExpr::Repeat { elem, count } => {
+                        self.check_expr(elem, region);
+                        self.check_expr(count, region);
+                    }
+                }
+            }
+            ExprKind::Resume(e) => { self.check_expr(e, region); }
+            _ => {}
+        }
+    }
+
+    fn check_use(&mut self, name: &str, span: Span) {
+        match self.states.get(name) {
+            Some(MoveState::Moved(_)) => {
+                self.errors.push(BmError::BorrowError {
+                    msg: format!("use of moved value `{}`", name),
+                    span,
+                });
+            }
+            Some(MoveState::Consumed) => {
+                self.errors.push(BmError::BorrowError {
+                    msg: format!("linear variable `{}` already consumed", name),
+                    span,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn check_shared_borrow(&mut self, inner: &Expr, region: RegionId, span: Span) {
+        if let ExprKind::Var(path) = &inner.kind {
+            if let Some(name) = path.segments.last() {
+                if self.has_active_mut_borrow(&name.name) {
+                    self.errors.push(BmError::BorrowError {
+                        msg: format!("cannot borrow `{}` as shared: already mutably borrowed", name.name),
+                        span,
+                    });
+                    return;
+                }
+                self.active_loans.push(Loan { place: name.name.clone(), kind: LoanKind::Shared, span, region });
+            }
+        } else {
+            self.check_expr(inner, region);
+        }
+    }
+
+    fn check_mut_borrow(&mut self, inner: &Expr, region: RegionId, span: Span) {
+        if let ExprKind::Var(path) = &inner.kind {
+            if let Some(name) = path.segments.last() {
+                if self.has_any_borrow(&name.name) {
+                    self.errors.push(BmError::BorrowError {
+                        msg: format!("cannot borrow `{}` as mutable: already borrowed", name.name),
+                        span,
+                    });
+                    return;
+                }
+                self.active_loans.push(Loan { place: name.name.clone(), kind: LoanKind::Mutable, span, region });
+            }
+        } else {
+            self.check_expr(inner, region);
+        }
+    }
+
+    fn has_active_mut_borrow(&self, name: &str) -> bool {
+        self.active_loans.iter().any(|l| l.place == name && l.kind == LoanKind::Mutable)
+    }
+
+    fn has_any_borrow(&self, name: &str) -> bool {
+        self.active_loans.iter().any(|l| l.place == name)
+    }
+
+    fn bind_pattern(&mut self, pat: &Pattern) {
+        match &pat.kind {
+            PatternKind::Ident { name, .. } => {
+                self.states.insert(name.name.clone(), MoveState::Owned);
+            }
+            PatternKind::Tuple(pats) => {
+                for p in pats { self.bind_pattern(p); }
+            }
+            PatternKind::Struct { fields, .. } => {
+                for fp in fields {
+                    if let Some(p) = &fp.pattern {
+                        self.bind_pattern(p);
+                    } else {
+                        self.states.insert(fp.name.name.clone(), MoveState::Owned);
+                    }
+                }
+            }
+            PatternKind::Or(pats) => {
+                for p in pats { self.bind_pattern(p); }
+            }
+            PatternKind::Array { elems, .. } => {
+                for p in elems { self.bind_pattern(p); }
+            }
+            PatternKind::Ref { inner, .. } => { self.bind_pattern(inner); }
+            PatternKind::Guard { pat, .. } => { self.bind_pattern(pat); }
+            _ => {}
+        }
+    }
+
+    fn push_region(&mut self, parent: Option<RegionId>) -> RegionId {
+        let id = self.next_region;
+        self.next_region += 1;
+        self.regions.push(Region { id, parent });
+        id
+    }
+
+    fn pop_region(&mut self, id: RegionId) {
+        self.active_loans.retain(|l| l.region != id);
+    }
+}

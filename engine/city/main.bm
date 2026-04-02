@@ -1,0 +1,261 @@
+/// BlackMagic Engine — city/main.bm
+///
+/// Oracle City — entry point.
+///
+/// Compile:
+///   bmc build --target wasm32 --emit wasm --sicko engine/city/main.bm -o oracle_city.wasm
+///
+/// Run in Bitburner:
+///   ns.run("oracle_city.wasm")
+///   OR via hub.js which auto-launches it
+///
+/// Controls:
+///   WASD      — move / strafe
+///   Mouse     — look
+///   E         — enter building
+///   Tab       — toggle map view
+///   T         — cycle through 5 visual themes
+///   Esc       — close panel / exit
+///
+/// The game loop:
+///   1. WebPlatform::new()     — create canvas, register event handlers
+///   2. CityMap::build()       — parse blueprint, fill raycaster cells
+///   3. Player::new(spawn)     — init player at spawn point
+///   4. loop: pump_events → player.update → raycaster.render → hud.draw → platform.present
+
+use engine::core::math::{ Vec2, Color, PI, cos, sin };
+use engine::scene::scene_tree::{ SceneTree };
+use engine::renderer::canvas::{ Canvas2D };
+use engine::renderer::raycast::{ Raycaster };
+use engine::input::event::{ InputState, InputQueue, InputMap, InputEvent, Key };
+use engine::audio::server::{ AudioServer };
+use engine::platform::web::{ WebPlatform };
+use engine::city::map::{ CityMap };
+use engine::city::player::{ Player };
+use engine::city::hud::{ HUD };
+use engine::city::theme::{ Theme, theme_get, N_THEMES };
+
+// ─── Canvas dimensions ────────────────────────────────────────────────────────
+
+const SCREEN_W: u32 = 960;
+const SCREEN_H: u32 = 540;
+const CANVAS_ID: str = "oracle-city-canvas";
+
+// ─── Engine state ─────────────────────────────────────────────────────────────
+
+struct EngineState {
+    platform:    WebPlatform,
+    canvas:      Canvas2D,
+    raycaster:   Raycaster,
+    audio:       AudioServer,
+    input_q:     InputQueue,
+    input_map:   InputMap,
+    input:       InputState,
+    city_map:    CityMap,
+    player:      Player,
+    hud:         HUD,
+    font:        DummyFont,
+    frame:       u64,
+    running:     bool,
+    tab_prev:    bool,
+    t_prev:      bool,   // single-press detection for T (theme cycle)
+    theme_idx:   u32,    // 0–4
+}
+
+// ─── Dummy font stub ─────────────────────────────────────────────────────────
+
+struct DummyFont {}
+
+// ─── WASM entry point ─────────────────────────────────────────────────────────
+
+#[export]
+pub fn bm_main() {
+    var state = init_engine();
+    run_loop(&var state);
+}
+
+fn init_engine() -> EngineState {
+    WebPlatform::log("Oracle City — BlackMagic Engine booting...");
+
+    let platform   = WebPlatform::new(SCREEN_W, SCREEN_H, CANVAS_ID);
+    let canvas     = Canvas2D::new(SCREEN_W, SCREEN_H);
+    let city_map   = CityMap::build();
+    let ray_map    = city_map.as_raycast_map();
+    var raycaster  = Raycaster::new(ray_map);
+    let player     = Player::new(city_map.start_pos);
+
+    raycaster.camera = player.camera;
+
+    var input_map = InputMap::new();
+    input_map.register_fps_defaults();
+
+    let audio = AudioServer::new(44100, 128);
+    let font  = DummyFont {};
+
+    WebPlatform::log("Engine ready.");
+
+    EngineState {
+        platform,
+        canvas,
+        raycaster,
+        audio,
+        input_q:    InputQueue::new(),
+        input_map,
+        input:      InputState::new(),
+        city_map,
+        player,
+        hud:        HUD::new(),
+        font,
+        frame:      0,
+        running:    true,
+        tab_prev:   false,
+        t_prev:     false,
+        theme_idx:  0,      // start on Midnight
+    }
+}
+
+fn run_loop(state: &var EngineState) {
+    while state.running {
+        let dt = state.platform.delta_time();
+
+        // Input
+        state.platform.pump_events(&var state.input_q);
+        state.input.update(&var state.input_q);
+        state.input_q.flush();
+
+        // Esc — close panel or exit
+        if state.input.is_key_held(27) {
+            match &state.player.interact {
+                engine::city::player::InteractState::None => { state.running = false; }
+                _ => {}
+            }
+        }
+
+        // Tab — toggle map view (single press)
+        let tab_now = state.input.is_key_held(9);
+        if tab_now && !state.tab_prev {
+            state.player.map_mode = !state.player.map_mode;
+        }
+        state.tab_prev = tab_now;
+
+        // T — cycle theme (single press)
+        let t_now = state.input.is_key_held(84);  // 84 = 'T'
+        if t_now && !state.t_prev {
+            state.theme_idx = (state.theme_idx + 1) % N_THEMES;
+        }
+        state.t_prev = t_now;
+
+        // Player update
+        state.player.update(&state.input, &state.city_map, dt);
+        state.raycaster.camera = state.player.camera;
+
+        // Render
+        if state.player.map_mode {
+            render_map_view(state);
+        } else {
+            render_3d_view(state);
+        }
+
+        // Audio
+        let audio_buf = state.audio.process(128);
+        state.platform.push_audio(audio_buf);
+
+        // Present
+        state.platform.present(&state.canvas.buf);
+        state.frame += 1;
+    }
+
+    state.platform.shutdown();
+    WebPlatform::log("Oracle City — shutdown.");
+}
+
+// ─── 3D view ─────────────────────────────────────────────────────────────────
+
+fn render_3d_view(state: &var EngineState) {
+    state.raycaster.render(&var state.canvas);
+
+    let theme = theme_get(state.theme_idx);
+    let font_ptr = &state.font as *DummyFont as *engine::renderer::canvas::BitmapFont;
+    let font_ref = unsafe { &*font_ptr };
+
+    state.hud.draw(&var state.canvas, &state.player, &state.city_map, font_ref, theme);
+}
+
+// ─── Top-down map view ───────────────────────────────────────────────────────
+
+// Layout constants mirroring hud.bm (sidebar=158, header=22, footer_y=520).
+const MAP_SB_W:  f32 = 158.0;
+const MAP_HDR_H: f32 =  22.0;
+const MAP_FTR_Y: f32 = 520.0;
+
+fn render_map_view(state: &var EngineState) {
+    let theme = theme_get(state.theme_idx);
+    let canvas = &var state.canvas;
+    canvas.clear(theme.bg);
+
+    let map     = &state.city_map;
+    let tile_px: f32 = 16.0;
+
+    // Centre the map inside the 3D area (right of sidebar, between header/footer).
+    let area_cx = (MAP_SB_W + SCREEN_W as f32) * 0.5;
+    let area_cy = (MAP_HDR_H + MAP_FTR_Y)      * 0.5;
+    let off_x = area_cx - state.player.camera.pos.x * tile_px;
+    let off_y = area_cy - state.player.camera.pos.y * tile_px;
+
+    // Tiles
+    var ty: u32 = 0;
+    while ty < map.height {
+        var tx: u32 = 0;
+        while tx < map.width {
+            let tile = map.tile_at(tx, ty);
+            let px   = off_x + tx as f32 * tile_px;
+            let py   = off_y + ty as f32 * tile_px;
+
+            let color = if tile.kind.is_solid() {
+                tile.kind.wall_color().darkened(0.35).blend(theme.accent, 0.07)
+            } else {
+                theme.map_floor
+            };
+            canvas.draw_rect(
+                engine::core::math::Rect2::new(px + 0.5, py + 0.5, tile_px - 1.0, tile_px - 1.0),
+                color,
+            );
+            // Enterable building: coloured centre circle
+            if tile.kind.is_enterable() {
+                canvas.draw_circle(
+                    Vec2::new(px + tile_px * 0.5, py + tile_px * 0.5),
+                    tile_px * 0.28,
+                    tile.kind.wall_color().with_alpha(0.65),
+                );
+            }
+            tx += 1;
+        }
+        ty += 1;
+    }
+
+    // Player position + FOV cone
+    let plr_px = off_x + state.player.camera.pos.x * tile_px;
+    let plr_py = off_y + state.player.camera.pos.y * tile_px;
+    let angle  = state.player.camera.angle;
+    let fov    = state.player.camera.fov;
+    let cone_r = tile_px * 4.0;
+
+    canvas.draw_line(
+        Vec2::new(plr_px, plr_py),
+        Vec2::new(plr_px + cos(angle - fov * 0.5) * cone_r,
+                  plr_py + sin(angle - fov * 0.5) * cone_r),
+        theme.map_fov.with_alpha(0.5),
+    );
+    canvas.draw_line(
+        Vec2::new(plr_px, plr_py),
+        Vec2::new(plr_px + cos(angle + fov * 0.5) * cone_r,
+                  plr_py + sin(angle + fov * 0.5) * cone_r),
+        theme.map_fov.with_alpha(0.5),
+    );
+    canvas.draw_circle(Vec2::new(plr_px, plr_py), 5.5, theme.player_dot);
+
+    // APEX TERMINAL HUD overlay (header + sidebar + footer)
+    let font_ptr = &state.font as *DummyFont as *engine::renderer::canvas::BitmapFont;
+    let font_ref = unsafe { &*font_ptr };
+    state.hud.draw_map_hud(&var state.canvas, &state.player, font_ref, theme);
+}

@@ -1,0 +1,117 @@
+/// BlackMagic Engine — engine.bm
+///
+/// Top-level module re-exports. Import this to get the full engine:
+///
+///   use engine::{ Canvas2D, Raycaster, SceneTree, ... };
+///
+/// Every sub-module is pure BlackMagic — no FFI, no C, no Rust.
+/// Platform I/O is mediated via #[wasm_import] / #[intrinsic] which
+/// are part of the BM language spec, not foreign language calls.
+///
+/// Module tree:
+///
+///   core/
+///     math.bm        — Vec2/3/4, Quat, Transform2D/3D, Color, Rect2, trig
+///     signal.bm      — Signal<T>, Callable<T>, SignalBus, deferred events
+///     resource.bm    — Rc<T>, RID<T>, Resource trait, ResourceCache, Loader
+///
+///   scene/
+///     node.bm        — Node (base, tree, groups, lifecycle, signals)
+///     node2d.bm      — Node2D (Transform2D, global/local conversion)
+///     scene_tree.bm  — SceneTree (frame loop, groups, pause, scene change)
+///
+///   renderer/
+///     canvas.bm      — CanvasBuffer (pixel array), Canvas2D draw commands
+///     raycast.bm     — DDA raycaster (first-person 3D, fisheye, textured walls)
+///
+///   physics/
+///     world2d.bm     — PhysicsWorld2D (AABB+circle, spatial hash, impulse resolve)
+///
+///   algo/
+///     sort.bm        — introsort (f32), radix sort (u32 + key-value pairs)
+///     pathfind.bm    — A* on uniform-cost grid, BFS reachability, binary min-heap
+///     spatial.bm     — spatial hash grid: insert, query_rect, query_radius
+///     noise.bm       — Perlin 2D/3D, FBM, value noise, smoothstep
+///     graph.bm       — weighted directed graph, Dijkstra, BFS
+///     geom.bm        — segment intersect, point-in-polygon, convex hull, circle tests
+///     flow.bm        — flow field (BFS flood-fill), O(1) per-agent direction query
+///
+///   input/
+///     event.bm       — InputEvent enum, InputQueue, InputState, InputMap
+///
+///   audio/
+///     server.bm      — AudioServer, AudioChannel, AudioBus, AudioEffect trait
+///
+///   platform/
+///     web.bm         — WebPlatform (WASM/Bitburner canvas, audio, input bridge)
+///     apex.bm        — ApexPlatform (#[intrinsic] bridge to APEX kernel services)
+///
+///   ai/
+///     tensor.bm      — Tensor, Dtype, elem_size, numel (CPU + GPU DMA)
+///     ops.bm         — matmul_f32, matmul_dispatch, softmax, rms_norm, rope, swiglu, dequant
+///     tokenizer.bm   — Tokenizer, Vocab, BPE encode/decode, TokenizerConfig
+///     kvcache.bm     — KvBlock, BlockAllocator, BlockTable, paged KV cache, prefix sharing
+///     attention.bm   — mha_forward, gqa_forward, paged_attn, flash_attn, attn_forward
+///     sampler.bm     — greedy/temperature/top-k/top-p/min-p, rep penalty, SamplingParams
+///     model.bm       — GgufReader (GGUF v3), ModelConfig, LlamaModel weight loader
+///     scheduler.bm   — Sequence, Scheduler, continuous batching, preemption
+///     vllm.bm        — VllmEngine (load → add_request → step → get_text)
+///     sglang.bm      — RadixCache, FsmState, constrained_decode, gen(), select()
+///
+///   city/
+///     theme.bm       — 5 visual themes (Midnight/Neon/Blood/Amber/Ghost), theme_get()
+///     map.bm         — CityMap, BuildingKind, Oracle City blueprint
+///     player.bm      — Player (FPS movement, collision, interact state)
+///     hud.bm         — HUD redesign v2: minimap, crosshair, compass, stats bar, panels
+///     main.bm        — Oracle City entry point (bm_main, game loop, T=cycle theme)
+///
+/// Build Oracle City:
+///   bmc build --target wasm32 --emit wasm --sicko engine/city/main.bm -o oracle_city.wasm
+///
+/// Check whole engine:
+///   bmc check engine/engine.bm
+
+pub use engine::core::math;
+pub use engine::core::signal;
+pub use engine::core::resource;
+
+pub use engine::scene::node;
+pub use engine::scene::node2d;
+pub use engine::scene::scene_tree;
+
+pub use engine::renderer::canvas;
+pub use engine::renderer::raycast;
+
+pub use engine::physics::world2d;
+
+pub use engine::algo::sort;
+pub use engine::algo::pathfind;
+pub use engine::algo::spatial;
+pub use engine::algo::noise;
+pub use engine::algo::graph;
+pub use engine::algo::geom;
+pub use engine::algo::flow;
+
+pub use engine::input::event;
+
+pub use engine::audio::server;
+
+pub use engine::platform::web;
+pub use engine::platform::apex;
+
+pub use engine::ai::tensor;
+pub use engine::ai::ops;
+pub use engine::ai::tokenizer;
+pub use engine::ai::kvcache;
+pub use engine::ai::attention;
+pub use engine::ai::sampler;
+pub use engine::ai::model;
+pub use engine::ai::scheduler;
+pub use engine::ai::vllm;
+pub use engine::ai::sglang;
+
+pub use engine::city::theme;
+pub use engine::city::map;
+pub use engine::city::player;
+pub use engine::city::hud;
+pub use engine::city::main;

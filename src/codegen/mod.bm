@@ -1,0 +1,49 @@
+/// BlackMagic Code Generation
+///
+/// Three backends:
+///   - C transpiler (portable, fast prototyping, debug builds)
+///   - LLVM IR (production builds — piped to `llc` / `clang`)
+///   - WASM binary (browser/edge targets)
+///
+/// Select via `--target c | llvm | wasm`
+
+pub mod c;
+pub mod llvm;
+pub mod wasm;
+
+use crate::mir::MirModule;
+use crate::error::BmError;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Target {
+    C,
+    Llvm,
+    Wasm,
+}
+
+pub struct CodegenOptions {
+    pub target:       Target,
+    pub optimise:     bool,
+    pub debug_info:   bool,
+    pub emit_mir:     bool,
+}
+
+impl Default for CodegenOptions {
+    fn default() -> Self {
+        CodegenOptions {
+            target:     Target::C,
+            optimise:   true,
+            debug_info: true,
+            emit_mir:   false,
+        }
+    }
+}
+
+pub fn generate(module: &MirModule, opts: &CodegenOptions) -> Result<Vec<u8>, Vec<BmError>> {
+    let ctx = &module.type_ctx;
+    match opts.target {
+        Target::C    => c::CCodegen::new(opts, ctx).generate(module),
+        Target::Llvm => llvm::LlvmCodegen::new(opts, ctx).generate(module),
+        Target::Wasm => wasm::WasmCodegen::new(opts, ctx).generate(module),
+    }
+}

@@ -1,0 +1,274 @@
+/// BlackMagic Engine — algo/graph.bm
+///
+/// Weighted directed graph — adjacency list, heap-based Dijkstra, BFS.
+///
+///   Graph      — sparse directed graph (node count fixed at construction)
+///   Dijkstra   — single-source shortest paths (positive weights only)
+///   bfs_graph  — unweighted BFS, predecessors + distances
+///
+/// Architecture:
+///   Edges stored in a flat pool; each node stores a head index into the pool
+///   (intrusive linked list, same pattern as SpatialGrid).
+///   All indices are u32; 0xFFFFFFFF is the sentinel "no node / no edge".
+///
+/// Usage:
+///   var g = Graph::new(8, 32);          // 8 nodes, room for 32 edges
+///   g.add_edge(0, 1, 1.5);
+///   g.add_edge(1, 3, 2.0);
+///   var dist = DijkstraResult::new(g.node_count());
+///   dijkstra(&g, 0, &var dist);
+///   // dist.dist[3] = 3.5  (0→1→3)
+///   dist.free();
+///   g.free();
+
+use bm::mem::{ alloc_slice, free_slice };
+
+// ─── Edge pool ────────────────────────────────────────────────────────────────
+
+struct Edge {
+    to:     u32,
+    weight: f32,
+    next:   u32,   // intrusive linked list per source node; 0xFFFFFFFF = end
+}
+
+// ─── Graph ────────────────────────────────────────────────────────────────────
+
+pub struct Graph {
+    pub node_n: u32,
+    heads:      *var u32,     // heads[node] = first edge index (0xFFFF = none)
+    edges:      *var Edge,
+    edge_count: u32,
+    max_edges:  u32,
+}
+
+impl Graph {
+    /// `node_n`    — fixed number of nodes
+    /// `max_edges` — max edges to store (directed; undirected needs 2× per pair)
+    pub fn new(node_n: u32, max_edges: u32) -> Graph {
+        let heads = alloc_slice::<u32>(node_n as usize);
+        var i: usize = 0;
+        while i < node_n as usize {
+            unsafe { *heads.add(i) = 0xFFFFFFFF; }
+            i += 1;
+        }
+        let edges = alloc_slice::<Edge>(max_edges as usize);
+        Graph { node_n, heads, edges, edge_count: 0, max_edges }
+    }
+
+    pub fn free(self: &var Graph) {
+        free_slice(self.heads, self.node_n as usize);
+        free_slice(self.edges, self.max_edges as usize);
+    }
+
+    /// Add a directed edge from `src` to `dst` with given weight.
+    /// No-op if src/dst ≥ node_n or edge pool is full.
+    pub fn add_edge(self: &var Graph, src: u32, dst: u32, weight: f32) {
+        if src >= self.node_n || dst >= self.node_n { return; }
+        if self.edge_count >= self.max_edges { return; }
+        let eidx = self.edge_count as usize;
+        let old_head = unsafe { *self.heads.add(src as usize) };
+        unsafe {
+            *self.edges.add(eidx) = Edge { to: dst, weight, next: old_head };
+            *self.heads.add(src as usize) = eidx as u32;
+        }
+        self.edge_count += 1;
+    }
+
+    /// Add an undirected edge (two directed edges).
+    pub fn add_undirected(self: &var Graph, a: u32, b: u32, weight: f32) {
+        self.add_edge(a, b, weight);
+        self.add_edge(b, a, weight);
+    }
+
+    pub fn node_count(self: &Graph) -> u32 { self.node_n }
+    pub fn edge_count(self: &Graph) -> u32 { self.edge_count }
+}
+
+// ─── Priority queue (min-heap on f32 dist) ────────────────────────────────────
+
+struct PQNode {
+    dist: f32,
+    node: u32,
+}
+
+struct PriorityQueue {
+    data:   *var PQNode,
+    len:    usize,
+    pool_n: usize,
+}
+
+impl PriorityQueue {
+    fn new(pool_n: usize) -> PriorityQueue {
+        let data = alloc_slice::<PQNode>(pool_n);
+        PriorityQueue { data, len: 0, pool_n }
+    }
+
+    fn free(self: &var PriorityQueue) { free_slice(self.data, self.pool_n); }
+
+    fn push(self: &var PriorityQueue, item: PQNode) {
+        if self.len >= self.pool_n { return; }
+        unsafe { *self.data.add(self.len) = item; }
+        var i = self.len;
+        self.len += 1;
+        while i > 0 {
+            let p = (i - 1) / 2;
+            if unsafe { (*self.data.add(i)).dist >= (*self.data.add(p)).dist } { break; }
+            unsafe {
+                let t = *self.data.add(i);
+                *self.data.add(i) = *self.data.add(p);
+                *self.data.add(p) = t;
+            }
+            i = p;
+        }
+    }
+
+    fn pop(self: &var PriorityQueue) -> PQNode {
+        let top = unsafe { *self.data.add(0) };
+        self.len -= 1;
+        if self.len > 0 {
+            unsafe { *self.data.add(0) = *self.data.add(self.len); }
+            var i: usize = 0;
+            loop {
+                let l = i * 2 + 1;
+                if l >= self.len { break; }
+                var s = i;
+                if unsafe { (*self.data.add(l)).dist < (*self.data.add(s)).dist } { s = l; }
+                if l + 1 < self.len && unsafe { (*self.data.add(l + 1)).dist < (*self.data.add(s)).dist } { s = l + 1; }
+                if s == i { break; }
+                unsafe {
+                    let t = *self.data.add(i);
+                    *self.data.add(i) = *self.data.add(s);
+                    *self.data.add(s) = t;
+                }
+                i = s;
+            }
+        }
+        top
+    }
+
+    fn is_empty(self: &PriorityQueue) -> bool { self.len == 0 }
+}
+
+// ─── Dijkstra result ─────────────────────────────────────────────────────────
+
+pub struct DijkstraResult {
+    pub dist: *var f32,   // dist[v] = shortest distance from source; 1e30 = unreachable
+    pub prev: *var u32,   // prev[v] = predecessor on shortest path; 0xFFFFFFFF = none
+    node_n:   u32,
+}
+
+impl DijkstraResult {
+    pub fn new(node_n: u32) -> DijkstraResult {
+        let dist = alloc_slice::<f32>(node_n as usize);
+        let prev = alloc_slice::<u32>(node_n as usize);
+        DijkstraResult { dist, prev, node_n }
+    }
+
+    pub fn free(self: &var DijkstraResult) {
+        free_slice(self.dist, self.node_n as usize);
+        free_slice(self.prev, self.node_n as usize);
+    }
+}
+
+/// Single-source shortest paths via Dijkstra.
+/// Requires non-negative edge weights.
+/// Result: out.dist[v] = min cost from src to v; out.prev[v] = predecessor.
+#[sicko]
+pub fn dijkstra(graph: &Graph, src: u32, out: &var DijkstraResult) {
+    let n = graph.node_n as usize;
+    var i: usize = 0;
+    while i < n {
+        unsafe { *out.dist.add(i) = 1e30; *out.prev.add(i) = 0xFFFFFFFF; }
+        i += 1;
+    }
+    if src >= graph.node_n { return; }
+    unsafe { *out.dist.add(src as usize) = 0.0; }
+
+    let heap_pool_n = n * 4 + 8;
+    var pq = PriorityQueue::new(heap_pool_n);
+    pq.push(PQNode { dist: 0.0, node: src });
+
+    while !pq.is_empty() {
+        let cur = pq.pop();
+        let u   = cur.node as usize;
+        let d   = unsafe { *out.dist.add(u) };
+        if cur.dist > d { continue; }    // stale entry
+
+        var eidx = unsafe { *graph.heads.add(u) };
+        while eidx != 0xFFFFFFFF {
+            let e  = unsafe { &*graph.edges.add(eidx as usize) };
+            let nd = d + e.weight;
+            let v  = e.to as usize;
+            if nd < unsafe { *out.dist.add(v) } {
+                unsafe { *out.dist.add(v) = nd; *out.prev.add(v) = u as u32; }
+                pq.push(PQNode { dist: nd, node: e.to });
+            }
+            eidx = e.next;
+        }
+    }
+
+    pq.free();
+}
+
+// ─── BFS result ───────────────────────────────────────────────────────────────
+
+pub struct BfsResult {
+    pub dist: *var u32,   // dist[v] = hop count from source; 0xFFFFFFFF = unreachable
+    pub prev: *var u32,   // prev[v] = predecessor; 0xFFFFFFFF = none
+    node_n:   u32,
+}
+
+impl BfsResult {
+    pub fn new(node_n: u32) -> BfsResult {
+        let dist = alloc_slice::<u32>(node_n as usize);
+        let prev = alloc_slice::<u32>(node_n as usize);
+        BfsResult { dist, prev, node_n }
+    }
+
+    pub fn free(self: &var BfsResult) {
+        free_slice(self.dist, self.node_n as usize);
+        free_slice(self.prev, self.node_n as usize);
+    }
+}
+
+/// Unweighted BFS from src.  Fills out.dist (hop counts) and out.prev.
+#[sicko]
+pub fn bfs_graph(graph: &Graph, src: u32, out: &var BfsResult) {
+    let n = graph.node_n as usize;
+    var i: usize = 0;
+    while i < n {
+        unsafe { *out.dist.add(i) = 0xFFFFFFFF; *out.prev.add(i) = 0xFFFFFFFF; }
+        i += 1;
+    }
+    if src >= graph.node_n { return; }
+    unsafe { *out.dist.add(src as usize) = 0; }
+
+    let queue = alloc_slice::<u32>(n);
+    var head: usize = 0;
+    var tail: usize = 0;
+    unsafe { *queue.add(tail) = src; }
+    tail += 1;
+
+    while head < tail {
+        let u    = unsafe { *queue.add(head) } as usize;
+        head += 1;
+        let udist = unsafe { *out.dist.add(u) };
+
+        var eidx = unsafe { *graph.heads.add(u) };
+        while eidx != 0xFFFFFFFF {
+            let e = unsafe { &*graph.edges.add(eidx as usize) };
+            let v = e.to as usize;
+            if unsafe { *out.dist.add(v) } == 0xFFFFFFFF {
+                unsafe {
+                    *out.dist.add(v) = udist + 1;
+                    *out.prev.add(v) = u as u32;
+                    *queue.add(tail) = e.to;
+                }
+                tail += 1;
+            }
+            eidx = e.next;
+        }
+    }
+
+    free_slice(queue, n);
+}

@@ -1,0 +1,394 @@
+/// BlackMagic Module System
+/// First-class modules, parametric modules (functors), module interfaces,
+/// hot-reload support, import resolution.
+
+use std::collections::HashMap;
+use crate::error::{BmError, Span};
+use crate::types::TypeId;
+
+// ─── Module IDs ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ModuleId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SymbolId(pub u32);
+
+// ─── Module graph ─────────────────────────────────────────────────────────────
+
+/// The global module graph: knows about every module in the compilation.
+pub struct ModuleGraph {
+    modules:  Vec<ModuleInfo>,
+    by_path:  HashMap<Vec<String>, ModuleId>,
+    errors:   Vec<BmError>,
+
+    // Symbol table: maps (module_id, name) → SymbolId
+    symbols:  Vec<SymbolInfo>,
+    sym_map:  HashMap<(ModuleId, String), SymbolId>,
+}
+
+impl ModuleGraph {
+    pub fn new() -> Self {
+        let mut g = ModuleGraph {
+            modules:  Vec::new(),
+            by_path:  HashMap::new(),
+            errors:   Vec::new(),
+            symbols:  Vec::new(),
+            sym_map:  HashMap::new(),
+        };
+        // Pre-register std root module
+        g.register(ModuleInfo {
+            id:         ModuleId(0),
+            path:       vec!["std".into()],
+            kind:       ModuleKind::Root,
+            exports:    vec![],
+            imports:    vec![],
+            params:     vec![],
+            implements: vec![],
+            hot_reload: false,
+            span:       Span::new(crate::error::Pos::ZERO, crate::error::Pos::ZERO),
+        });
+        g
+    }
+
+    pub fn register(&mut self, info: ModuleInfo) -> ModuleId {
+        let id = if info.id.0 == 0 && self.modules.is_empty() {
+            ModuleId(0)
+        } else {
+            ModuleId(self.modules.len() as u32)
+        };
+        self.by_path.insert(info.path.clone(), id);
+        self.modules.push(info);
+        id
+    }
+
+    pub fn lookup(&self, path: &[String]) -> Option<ModuleId> {
+        self.by_path.get(path).copied()
+    }
+
+    pub fn get(&self, id: ModuleId) -> &ModuleInfo {
+        &self.modules[id.0 as usize]
+    }
+
+    pub fn get_mut(&mut self, id: ModuleId) -> &mut ModuleInfo {
+        &mut self.modules[id.0 as usize]
+    }
+
+    // ── Symbol resolution ────────────────────────────────────────────────────
+
+    pub fn define_symbol(&mut self, module: ModuleId, name: String, info: SymbolInfo) -> SymbolId {
+        let id = SymbolId(self.symbols.len() as u32);
+        let key = (module, name.clone());
+        if self.sym_map.contains_key(&key) {
+            // Duplicate definition — record error
+            let span = info.span;
+            let first = self.symbols[self.sym_map[&key].0 as usize].span;
+            self.errors.push(BmError::DuplicateExport { span, name, first });
+            return SymbolId(self.sym_map[&key].0);
+        }
+        self.sym_map.insert(key, id);
+        self.symbols.push(info);
+        self.modules[module.0 as usize].exports.push(id);
+        id
+    }
+
+    pub fn resolve_symbol(&self, module: ModuleId, name: &str) -> Option<SymbolId> {
+        self.sym_map.get(&(module, name.to_string())).copied()
+    }
+
+    /// Resolve a dotted path like std::io::println
+    pub fn resolve_path(&self, path: &[String], from: ModuleId) -> Result<SymbolId, BmError> {
+        if path.is_empty() {
+            return Err(BmError::InternalError { msg: "empty path".into() });
+        }
+        if path.len() == 1 {
+            // Local lookup
+            if let Some(sym) = self.resolve_symbol(from, &path[0]) {
+                return Ok(sym);
+            }
+            // Check imports
+            let imports = self.modules[from.0 as usize].imports.clone();
+            for imp in &imports {
+                if let Some(alias) = &imp.alias {
+                    if alias == &path[0] {
+                        return self.resolve_path(&imp.src_path, from);
+                    }
+                } else if let Some(last) = imp.src_path.last() {
+                    if last == &path[0] {
+                        return self.resolve_path(&imp.src_path, from);
+                    }
+                }
+            }
+            let span = Span::new(crate::error::Pos::ZERO, crate::error::Pos::ZERO);
+            return Err(BmError::UndefinedVariable { span, name: path[0].clone() });
+        }
+
+        // Module path: find the module first
+        let mod_path: Vec<String> = path[..path.len()-1].to_vec();
+        let sym_name = &path[path.len()-1];
+        if let Some(mod_id) = self.lookup(&mod_path) {
+            if let Some(sym) = self.resolve_symbol(mod_id, sym_name) {
+                return Ok(sym);
+            }
+            let span = Span::new(crate::error::Pos::ZERO, crate::error::Pos::ZERO);
+            return Err(BmError::UndefinedVariable { span, name: sym_name.clone() });
+        }
+        let span = Span::new(crate::error::Pos::ZERO, crate::error::Pos::ZERO);
+        Err(BmError::ModuleNotFound { span, path: mod_path.join("::") })
+    }
+
+    // ── Cycle detection ──────────────────────────────────────────────────────
+
+    pub fn detect_cycles(&self) -> Vec<Vec<String>> {
+        // DFS-based cycle detection
+        let n = self.modules.len();
+        let mut visited  = vec![false; n];
+        let mut in_stack = vec![false; n];
+        let mut cycles   = Vec::new();
+
+        fn dfs(
+            g: &ModuleGraph, u: usize,
+            visited: &mut Vec<bool>, in_stack: &mut Vec<bool>,
+            stack: &mut Vec<String>, cycles: &mut Vec<Vec<String>>,
+        ) {
+            visited[u]  = true;
+            in_stack[u] = true;
+            stack.push(g.modules[u].path.join("::"));
+
+            for import in &g.modules[u].imports {
+                if let Some(&v_id) = g.by_path.get(&import.src_path) {
+                    let v = v_id.0 as usize;
+                    if in_stack[v] {
+                        // Found cycle
+                        let start = stack.iter().position(|s| {
+                            s == &g.modules[v].path.join("::")
+                        }).unwrap_or(0);
+                        cycles.push(stack[start..].to_vec());
+                    } else if !visited[v] {
+                        dfs(g, v, visited, in_stack, stack, cycles);
+                    }
+                }
+            }
+
+            in_stack[u] = false;
+            stack.pop();
+        }
+
+        let mut stack = Vec::new();
+        for i in 0..n {
+            if !visited[i] {
+                dfs(self, i, &mut visited, &mut in_stack, &mut stack, &mut cycles);
+            }
+        }
+        cycles
+    }
+
+    // ── Topological sort (compilation order) ─────────────────────────────────
+
+    pub fn topo_order(&self) -> Vec<ModuleId> {
+        let n = self.modules.len();
+        let mut in_degree = vec![0u32; n];
+        let mut adj: Vec<Vec<usize>> = vec![vec![]; n];
+
+        for (u, m) in self.modules.iter().enumerate() {
+            for import in &m.imports {
+                if let Some(&v_id) = self.by_path.get(&import.src_path) {
+                    adj[v_id.0 as usize].push(u);
+                    in_degree[u] += 1;
+                }
+            }
+        }
+
+        let mut queue: std::collections::VecDeque<usize> = in_degree.iter()
+            .enumerate()
+            .filter(|(_, &d)| d == 0)
+            .map(|(i, _)| i)
+            .collect();
+
+        let mut order = Vec::new();
+        while let Some(u) = queue.pop_front() {
+            order.push(ModuleId(u as u32));
+            for &v in &adj[u] {
+                in_degree[v] -= 1;
+                if in_degree[v] == 0 { queue.push_back(v); }
+            }
+        }
+        order
+    }
+
+    pub fn errors(&self) -> &[BmError] { &self.errors }
+}
+
+// ─── Module info ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ModuleInfo {
+    pub id:         ModuleId,
+    pub path:       Vec<String>,        // ["std", "io"]
+    pub kind:       ModuleKind,
+    pub exports:    Vec<SymbolId>,
+    pub imports:    Vec<Import>,
+    pub params:     Vec<ModuleParam>,   // parametric module params
+    pub implements: Vec<Vec<String>>,   // interfaces it implements
+    pub hot_reload: bool,
+    pub span:       Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum ModuleKind {
+    Root,           // top-level source file
+    Inline,         // `module foo { ... }` inside another module
+    Parametric,     // `module Vec(T: type) { ... }`
+    Instance,       // result of instantiating a parametric module
+    Extern,         // FFI module
+    Builtin,        // std lib module
+}
+
+#[derive(Debug, Clone)]
+pub struct Import {
+    pub src_path: Vec<String>,   // e.g. ["std", "io"]
+    pub alias:    Option<String>,
+    pub glob:     bool,
+    pub span:     Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModuleParam {
+    pub name:  String,
+    pub kind:  ModuleParamKind,
+    pub span:  Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum ModuleParamKind {
+    Type,
+    Const(TypeId),
+    Module(Vec<String>), // interface path
+}
+
+// ─── Symbols ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct SymbolInfo {
+    pub name:    String,
+    pub kind:    SymbolKind,
+    pub module:  ModuleId,
+    pub ty:      Option<TypeId>,
+    pub vis:     SymbolVis,
+    pub span:    Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum SymbolKind {
+    Function  { is_comptime: bool, is_pure: bool, is_dispatch: bool },
+    Struct    { is_linear: bool },
+    Enum,
+    Trait,
+    Effect,
+    Actor,
+    Module(ModuleId),
+    TypeAlias,
+    Const,
+    Static { mutable: bool },
+    Interface,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SymbolVis {
+    Public,
+    Package,
+    Module,
+    Private,
+}
+
+// ─── Module instantiation ────────────────────────────────────────────────────
+
+/// Instantiate a parametric module with concrete arguments.
+/// Returns a new ModuleId representing the instantiated module.
+pub fn instantiate_module(
+    graph:  &mut ModuleGraph,
+    base:   ModuleId,
+    args:   &[ModuleArg],
+) -> Result<ModuleId, BmError> {
+    let base_info = graph.get(base).clone();
+    if base_info.params.len() != args.len() {
+        return Err(BmError::ArityMismatch {
+            span:     base_info.span,
+            expected: base_info.params.len(),
+            found:    args.len(),
+        });
+    }
+
+    // Create a path for the instance: Vec<i32> → ["Vec", "$i32"]
+    let mut inst_path = base_info.path.clone();
+    let suffix: String = args.iter()
+        .map(|a| match a {
+            ModuleArg::Type(t) => format!("${:?}", t),
+            ModuleArg::Const(v) => format!("#{}", v),
+            ModuleArg::Module(m) => graph.get(*m).path.join("_"),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    inst_path.push(format!("<{}>", suffix));
+
+    // Check cache
+    if let Some(existing) = graph.lookup(&inst_path) {
+        return Ok(existing);
+    }
+
+    // Register instance
+    let inst = ModuleInfo {
+        id:         ModuleId(graph.modules.len() as u32),
+        path:       inst_path,
+        kind:       ModuleKind::Instance,
+        exports:    vec![],
+        imports:    base_info.imports.clone(),
+        params:     vec![],
+        implements: base_info.implements.clone(),
+        hot_reload: false,
+        span:       base_info.span,
+    };
+    Ok(graph.register(inst))
+}
+
+#[derive(Debug, Clone)]
+pub enum ModuleArg {
+    Type(TypeId),
+    Const(i64),
+    Module(ModuleId),
+}
+
+// ─── Hot-reload support ───────────────────────────────────────────────────────
+
+/// Tracks which modules are hot-reloadable and their current version.
+pub struct HotReloadRegistry {
+    versions: HashMap<ModuleId, u64>,
+    watchers: Vec<Box<dyn Fn(ModuleId, u64)>>,
+}
+
+impl HotReloadRegistry {
+    pub fn new() -> Self {
+        HotReloadRegistry { versions: HashMap::new(), watchers: Vec::new() }
+    }
+
+    pub fn register(&mut self, id: ModuleId) {
+        self.versions.insert(id, 1);
+    }
+
+    /// Called when a module's source changes.
+    pub fn bump_version(&mut self, id: ModuleId) -> u64 {
+        let v = self.versions.entry(id).or_insert(0);
+        *v += 1;
+        let ver = *v;
+        for w in &self.watchers { w(id, ver); }
+        ver
+    }
+
+    pub fn version(&self, id: ModuleId) -> u64 {
+        self.versions.get(&id).copied().unwrap_or(0)
+    }
+
+    pub fn on_reload(&mut self, f: impl Fn(ModuleId, u64) + 'static) {
+        self.watchers.push(Box::new(f));
+    }
+}

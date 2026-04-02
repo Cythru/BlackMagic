@@ -1,0 +1,847 @@
+/// BlackMagic Language Lexer
+/// Full tokeniser: keywords, literals (int/float/str/char), operators,
+/// comments, SIMD types, attributes, lifetimes, string interpolation.
+
+use crate::error::{BmError, Pos, Span};
+
+// ─── Token kinds ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TokenKind {
+    // Literals
+    IntLit(u128),
+    FloatLit(f64),
+    StrLit(String),
+    CharLit(char),
+    ByteLit(u8),
+    BoolLit(bool),
+
+    // Identifier / keyword
+    Ident(String),
+
+    // Keywords — control flow
+    KwFn,
+    KwReturn, KwBreak, KwContinue,
+    KwIf, KwElse,
+    KwMatch,
+    KwWhile, KwFor, KwIn,
+    KwDefer,
+    KwAsync, KwAwait,
+
+    // Keywords — declarations
+    KwLet, KwVar, KwConst, KwStatic,
+    KwStruct, KwEnum, KwTrait, KwImpl,
+    KwModule, KwInterface,
+    KwUse, KwMod,
+    KwType,
+
+    // Keywords — memory / ownership
+    KwOwned, KwMove, KwCopy, KwDrop,
+    KwLinear, KwBorrow, KwRegion,
+
+    // Keywords — effects / actors
+    KwEffect, KwHandle, KwResume,
+    KwActor, KwReceive, KwSpawn,
+
+    // Keywords — metaprogramming
+    KwComptime, KwMacro,
+
+    // Keywords — visibility / modifiers
+    KwPub, KwPriv, KwExtern, KwUnsafe,
+    KwPure, KwTotal, KwLazy, KwAtomic,
+    KwPacked, KwAlign, KwSoa, KwVolatile,
+
+    // Keywords — dispatch / concurrency
+    KwDispatch,
+
+    // Keywords — FFI
+    KwAsm,
+
+    // Keywords — misc
+    KwWhere, KwAs, KwIs,
+    KwAnd, KwOr, KwNot,
+    KwTrue, KwFalse, KwNull,
+    KwSelf, KwSuper,
+    KwNever, KwCap,
+
+    // Primitive types as keywords
+    KwI8, KwI16, KwI32, KwI64, KwI128, KwIsize, KwInt,
+    KwU8, KwU16, KwU32, KwU64, KwU128, KwUsize, KwUint,
+    KwF16, KwF32, KwF64, KwF128,
+    KwBool, KwChar, KwStr, KwVoid, KwByte,
+
+    // Attributes
+    Attribute(String),          // #[name...]
+
+    // Lifetime
+    Lifetime(String),           // 'name
+
+    // Punctuation
+    LParen, RParen,             // ( )
+    LBracket, RBracket,         // [ ]
+    LBrace, RBrace,             // { }
+    Comma,                      // ,
+    Semi,                       // ;
+    Colon,                      // :
+    ColonColon,                 // ::
+    Dot,                        // .
+    DotDot,                     // ..
+    DotDotDot,                  // ...
+    DotDotEq,                   // ..=
+    At,                         // @
+    Hash,                       // #
+    Dollar,                     // $
+    Question,                   // ?
+    Tilde,                      // ~
+
+    // Arithmetic operators
+    Plus, Minus, Star, Slash, Percent,
+    StarStar,                   // **  (power)
+
+    // Bitwise operators
+    Caret, Amp, Pipe, Tilde2,   // ^ & | ~
+    LtLt, GtGt,                 // << >>
+
+    // Logical operators
+    AmpAmp, PipePipe, Bang,     // && || !
+
+    // Comparison
+    Eq, EqEq, BangEq,           // = == !=
+    Lt, Gt, LtEq, GtEq,        // < > <= >=
+
+    // Assignment operators
+    PlusEq, MinusEq, StarEq, SlashEq, PercentEq,
+    CaretEq, AmpEq, PipeEq, LtLtEq, GtGtEq,
+
+    // Arrow operators
+    Arrow,                      // ->
+    FatArrow,                   // =>
+
+    // Effect separator
+    Bang2,                      // used in effect context
+
+    // Macro invocation
+    MacroCall(String),          // name!
+
+    // End of file
+    Eof,
+}
+
+impl TokenKind {
+    pub fn is_literal(&self) -> bool {
+        matches!(self,
+            TokenKind::IntLit(_) | TokenKind::FloatLit(_) |
+            TokenKind::StrLit(_) | TokenKind::CharLit(_) |
+            TokenKind::ByteLit(_)| TokenKind::BoolLit(_)
+        )
+    }
+
+    pub fn is_keyword(&self) -> bool {
+        matches!(self,
+            TokenKind::KwFn | TokenKind::KwReturn | TokenKind::KwBreak |
+            TokenKind::KwIf | TokenKind::KwElse   | TokenKind::KwMatch
+            // ... (abbreviated for brevity)
+        )
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            TokenKind::IntLit(n)    => format!("integer literal `{n}`"),
+            TokenKind::FloatLit(f)  => format!("float literal `{f}`"),
+            TokenKind::StrLit(s)    => format!("string literal `\"{s}\"`"),
+            TokenKind::CharLit(c)   => format!("char literal `'{c}'`"),
+            TokenKind::Ident(s)     => format!("identifier `{s}`"),
+            TokenKind::Eof          => "end of file".into(),
+            TokenKind::LParen       => "`(`".into(),
+            TokenKind::RParen       => "`)`".into(),
+            TokenKind::LBracket     => "`[`".into(),
+            TokenKind::RBracket     => "`]`".into(),
+            TokenKind::LBrace       => "`{`".into(),
+            TokenKind::RBrace       => "`}`".into(),
+            TokenKind::Arrow        => "`->`".into(),
+            TokenKind::FatArrow     => "`=>`".into(),
+            TokenKind::ColonColon   => "`::`".into(),
+            TokenKind::Semi         => "`;`".into(),
+            TokenKind::Colon        => "`:`".into(),
+            TokenKind::Comma        => "`,`".into(),
+            _ => format!("{:?}", self),
+        }
+    }
+}
+
+// ─── Token ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct Token {
+    pub kind: TokenKind,
+    pub span: Span,
+}
+
+impl Token {
+    pub fn new(kind: TokenKind, span: Span) -> Self { Token { kind, span } }
+}
+
+// ─── Lexer ───────────────────────────────────────────────────────────────────
+
+pub struct Lexer<'src> {
+    src:    &'src str,
+    chars:  std::iter::Peekable<std::str::CharIndices<'src>>,
+    pos:    Pos,
+    errors: Vec<BmError>,
+}
+
+impl<'src> Lexer<'src> {
+    pub fn new(src: &'src str) -> Self {
+        Lexer {
+            src,
+            chars: src.char_indices().peekable(),
+            pos:   Pos::ZERO,
+            errors: Vec::new(),
+        }
+    }
+
+    // Tokenise the entire source, returning tokens + any errors collected.
+    pub fn tokenise(mut self) -> (Vec<Token>, Vec<BmError>) {
+        let mut tokens = Vec::new();
+        loop {
+            let tok = self.next_token();
+            let is_eof = tok.kind == TokenKind::Eof;
+            tokens.push(tok);
+            if is_eof { break; }
+        }
+        (tokens, self.errors)
+    }
+
+    // ── Peek / advance helpers ────────────────────────────────────────────
+
+    fn peek(&mut self) -> Option<char> {
+        self.chars.peek().map(|&(_, c)| c)
+    }
+
+    fn peek2(&self) -> Option<char> {
+        let mut it = self.chars.clone();
+        it.next();
+        it.next().map(|(_, c)| c)
+    }
+
+    fn advance(&mut self) -> Option<char> {
+        if let Some((_, c)) = self.chars.next() {
+            if c == '\n' {
+                self.pos.line += 1;
+                self.pos.col   = 1;
+            } else {
+                self.pos.col += 1;
+            }
+            self.pos.byte += c.len_utf8() as u32;
+            Some(c)
+        } else {
+            None
+        }
+    }
+
+    fn eat_if(&mut self, expected: char) -> bool {
+        if self.peek() == Some(expected) { self.advance(); true } else { false }
+    }
+
+    fn eat_if2(&mut self, a: char, b: char) -> bool {
+        if self.peek() == Some(a) && self.peek2() == Some(b) {
+            self.advance(); self.advance(); true
+        } else { false }
+    }
+
+    fn current_pos(&self) -> Pos { self.pos }
+
+    fn span_from(&self, start: Pos) -> Span { Span::new(start, self.pos) }
+
+    // ── Skip whitespace & comments ────────────────────────────────────────
+
+    fn skip_whitespace_and_comments(&mut self) {
+        loop {
+            // whitespace
+            while matches!(self.peek(), Some(' ' | '\t' | '\r' | '\n')) {
+                self.advance();
+            }
+            // line comment
+            if self.peek() == Some('/') && self.peek2() == Some('/') {
+                while self.peek().is_some() && self.peek() != Some('\n') {
+                    self.advance();
+                }
+                continue;
+            }
+            // block comment (nestable)
+            if self.peek() == Some('/') && self.peek2() == Some('*') {
+                let start = self.current_pos();
+                self.advance(); self.advance(); // eat /*
+                let mut depth = 1usize;
+                loop {
+                    match self.peek() {
+                        None => {
+                            self.errors.push(BmError::UnterminatedComment { start });
+                            return;
+                        }
+                        Some('/') if self.peek2() == Some('*') => {
+                            self.advance(); self.advance();
+                            depth += 1;
+                        }
+                        Some('*') if self.peek2() == Some('/') => {
+                            self.advance(); self.advance();
+                            depth -= 1;
+                            if depth == 0 { break; }
+                        }
+                        _ => { self.advance(); }
+                    }
+                }
+                continue;
+            }
+            break;
+        }
+    }
+
+    // ── Main token dispatch ───────────────────────────────────────────────
+
+    fn next_token(&mut self) -> Token {
+        self.skip_whitespace_and_comments();
+
+        let start = self.current_pos();
+
+        let ch = match self.advance() {
+            None    => return Token::new(TokenKind::Eof, self.span_from(start)),
+            Some(c) => c,
+        };
+
+        let kind = match ch {
+            // ─── Single-char punctuation ─────────────────────────────────
+            '(' => TokenKind::LParen,
+            ')' => TokenKind::RParen,
+            '[' => TokenKind::LBracket,
+            ']' => TokenKind::RBracket,
+            '{' => TokenKind::LBrace,
+            '}' => TokenKind::RBrace,
+            ',' => TokenKind::Comma,
+            ';' => TokenKind::Semi,
+            '~' => TokenKind::Tilde,
+            '@' => TokenKind::At,
+            '$' => TokenKind::Dollar,
+
+            // ─── Colon / :: ──────────────────────────────────────────────
+            ':' => {
+                if self.eat_if(':') { TokenKind::ColonColon }
+                else                { TokenKind::Colon }
+            }
+
+            // ─── Dot / .. / ... / ..= ────────────────────────────────────
+            '.' => {
+                if self.eat_if('.') {
+                    if self.eat_if('.')      { TokenKind::DotDotDot }
+                    else if self.eat_if('=') { TokenKind::DotDotEq  }
+                    else                     { TokenKind::DotDot    }
+                } else { TokenKind::Dot }
+            }
+
+            // ─── Question mark ───────────────────────────────────────────
+            '?' => TokenKind::Question,
+
+            // ─── Arithmetic ──────────────────────────────────────────────
+            '+' => {
+                if self.eat_if('=') { TokenKind::PlusEq }
+                else                { TokenKind::Plus   }
+            }
+            '-' => {
+                if self.eat_if('>')      { TokenKind::Arrow   }
+                else if self.eat_if('=') { TokenKind::MinusEq }
+                else                     { TokenKind::Minus   }
+            }
+            '*' => {
+                if self.eat_if('*')      { TokenKind::StarStar }
+                else if self.eat_if('=') { TokenKind::StarEq   }
+                else                     { TokenKind::Star     }
+            }
+            '/' => {
+                if self.eat_if('=') { TokenKind::SlashEq }
+                else                { TokenKind::Slash   }
+            }
+            '%' => {
+                if self.eat_if('=') { TokenKind::PercentEq }
+                else                { TokenKind::Percent   }
+            }
+
+            // ─── Bitwise ─────────────────────────────────────────────────
+            '^' => {
+                if self.eat_if('=') { TokenKind::CaretEq }
+                else                { TokenKind::Caret   }
+            }
+            '&' => {
+                if self.eat_if('&')      { TokenKind::AmpAmp }
+                else if self.eat_if('=') { TokenKind::AmpEq  }
+                else                     { TokenKind::Amp    }
+            }
+            '|' => {
+                if self.eat_if('|')      { TokenKind::PipePipe }
+                else if self.eat_if('=') { TokenKind::PipeEq   }
+                else                     { TokenKind::Pipe     }
+            }
+
+            // ─── Comparison / assignment ─────────────────────────────────
+            '=' => {
+                if self.eat_if('>')      { TokenKind::FatArrow }
+                else if self.eat_if('=') { TokenKind::EqEq     }
+                else                     { TokenKind::Eq       }
+            }
+            '!' => {
+                if self.eat_if('=') { TokenKind::BangEq }
+                else                { TokenKind::Bang   }
+            }
+            '<' => {
+                if self.eat_if('<') {
+                    if self.eat_if('=') { TokenKind::LtLtEq } else { TokenKind::LtLt }
+                } else if self.eat_if('=') { TokenKind::LtEq }
+                else                       { TokenKind::Lt   }
+            }
+            '>' => {
+                if self.eat_if('>') {
+                    if self.eat_if('=') { TokenKind::GtGtEq } else { TokenKind::GtGt }
+                } else if self.eat_if('=') { TokenKind::GtEq }
+                else                       { TokenKind::Gt   }
+            }
+
+            // ─── Hash: attribute or just # ───────────────────────────────
+            '#' => {
+                if self.eat_if('[') {
+                    self.lex_attribute(start)
+                } else {
+                    TokenKind::Hash
+                }
+            }
+
+            // ─── Lifetime or char ─────────────────────────────────────────
+            '\'' => self.lex_lifetime_or_char(start),
+
+            // ─── Raw string r"..." ────────────────────────────────────────
+            'r' if self.peek() == Some('"') => {
+                self.advance(); // eat "
+                self.lex_raw_string(start)
+            }
+
+            // ─── Byte string b"..." ───────────────────────────────────────
+            'b' if self.peek() == Some('"') => {
+                self.advance();
+                self.lex_byte_string(start)
+            }
+
+            // ─── String literal ───────────────────────────────────────────
+            '"' => self.lex_string(start),
+
+            // ─── Numeric literal ──────────────────────────────────────────
+            '0'..='9' => self.lex_number(ch, start),
+
+            // ─── Identifier / keyword / macro call ───────────────────────
+            c if c == '_' || c.is_alphabetic() => self.lex_ident_or_keyword(c, start),
+
+            // ─── Unknown ─────────────────────────────────────────────────
+            c => {
+                self.errors.push(BmError::UnexpectedChar { ch: c, pos: start });
+                TokenKind::Ident("?".into()) // recovery token
+            }
+        };
+
+        Token::new(kind, self.span_from(start))
+    }
+
+    // ── Attribute: #[name(params...)] ────────────────────────────────────
+
+    fn lex_attribute(&mut self, _start: Pos) -> TokenKind {
+        let mut attr = String::new();
+        let mut depth = 1usize;
+        loop {
+            match self.peek() {
+                None => { self.errors.push(BmError::UnterminatedString { start: _start }); break; }
+                Some('[') => { depth += 1; attr.push('['); self.advance(); }
+                Some(']') => {
+                    depth -= 1;
+                    self.advance();
+                    if depth == 0 { break; }
+                    attr.push(']');
+                }
+                Some(c) => { attr.push(c); self.advance(); }
+            }
+        }
+        TokenKind::Attribute(attr)
+    }
+
+    // ── Lifetime 'name or char 'a' ────────────────────────────────────────
+
+    fn lex_lifetime_or_char(&mut self, start: Pos) -> TokenKind {
+        // Could be 'a (lifetime) or 'a' (char)
+        let c = match self.peek() {
+            Some(c) => c,
+            None    => {
+                self.errors.push(BmError::UnexpectedChar { ch: '\'', pos: start });
+                return TokenKind::CharLit('\0');
+            }
+        };
+
+        if c.is_alphabetic() || c == '_' {
+            // Peek ahead to see if there's a closing quote
+            let mut ident = String::new();
+            while matches!(self.peek(), Some(c) if c.is_alphanumeric() || c == '_') {
+                ident.push(self.advance().unwrap());
+            }
+            if self.peek() == Some('\'') {
+                // Single char literal like 'a'
+                self.advance();
+                if ident.chars().count() == 1 {
+                    return TokenKind::CharLit(ident.chars().next().unwrap());
+                } else {
+                    self.errors.push(BmError::UnexpectedChar { ch: '\'', pos: start });
+                    return TokenKind::CharLit('\0');
+                }
+            }
+            // It's a lifetime
+            return TokenKind::Lifetime(ident);
+        }
+
+        // Char literal with escape
+        if c == '\\' {
+            self.advance(); // eat backslash
+            let escaped = self.lex_escape(start);
+            if self.eat_if('\'') {
+                return TokenKind::CharLit(escaped.unwrap_or('\0'));
+            }
+            self.errors.push(BmError::UnterminatedString { start });
+            return TokenKind::CharLit('\0');
+        }
+
+        // Ordinary char
+        self.advance();
+        let result = TokenKind::CharLit(c);
+        if !self.eat_if('\'') {
+            self.errors.push(BmError::UnterminatedString { start });
+        }
+        result
+    }
+
+    // ── String literal "..." with interpolation ───────────────────────────
+
+    fn lex_string(&mut self, start: Pos) -> TokenKind {
+        let mut s = String::new();
+        loop {
+            match self.peek() {
+                None | Some('\n') => {
+                    self.errors.push(BmError::UnterminatedString { start });
+                    break;
+                }
+                Some('"') => { self.advance(); break; }
+                Some('\\') => {
+                    self.advance();
+                    if let Some(c) = self.lex_escape(start) { s.push(c); }
+                }
+                Some('{') if self.peek2() != Some('{') => {
+                    // String interpolation {expr} — emit as-is for now
+                    // A real implementation would tokenise inner expr
+                    s.push('{');
+                    self.advance();
+                    let mut depth = 1;
+                    while let Some(c) = self.peek() {
+                        self.advance();
+                        if c == '{' { depth += 1; s.push(c); }
+                        else if c == '}' {
+                            depth -= 1;
+                            if depth == 0 { s.push('}'); break; }
+                            s.push(c);
+                        } else { s.push(c); }
+                    }
+                }
+                Some(c) => { s.push(c); self.advance(); }
+            }
+        }
+        TokenKind::StrLit(s)
+    }
+
+    fn lex_raw_string(&mut self, start: Pos) -> TokenKind {
+        let mut s = String::new();
+        loop {
+            match self.peek() {
+                None => { self.errors.push(BmError::UnterminatedString { start }); break; }
+                Some('"') => { self.advance(); break; }
+                Some(c)   => { s.push(c); self.advance(); }
+            }
+        }
+        TokenKind::StrLit(s)
+    }
+
+    fn lex_byte_string(&mut self, start: Pos) -> TokenKind {
+        // Simplified: lex like a string but return it as a StrLit
+        // A full impl would return Vec<u8>
+        self.lex_string(start)
+    }
+
+    // ── Escape sequences ──────────────────────────────────────────────────
+
+    fn lex_escape(&mut self, pos: Pos) -> Option<char> {
+        match self.advance() {
+            Some('n')  => Some('\n'),
+            Some('t')  => Some('\t'),
+            Some('r')  => Some('\r'),
+            Some('\\') => Some('\\'),
+            Some('"')  => Some('"'),
+            Some('\'') => Some('\''),
+            Some('0')  => Some('\0'),
+            Some('u')  => {
+                if self.eat_if('{') {
+                    let start = self.current_pos();
+                    let mut hex = String::new();
+                    while matches!(self.peek(), Some('0'..='9' | 'a'..='f' | 'A'..='F' | '_')) {
+                        if self.peek() != Some('_') {
+                            hex.push(self.peek().unwrap());
+                        }
+                        self.advance();
+                    }
+                    if !self.eat_if('}') {
+                        self.errors.push(BmError::InvalidUnicodeEscape {
+                            span: self.span_from(start) });
+                        return None;
+                    }
+                    u32::from_str_radix(&hex, 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .or_else(|| {
+                            self.errors.push(BmError::InvalidUnicodeEscape {
+                                span: self.span_from(start) });
+                            None
+                        })
+                } else {
+                    self.errors.push(BmError::InvalidEscape { ch: 'u', pos });
+                    None
+                }
+            }
+            Some(c) => {
+                self.errors.push(BmError::InvalidEscape { ch: c, pos });
+                None
+            }
+            None => None,
+        }
+    }
+
+    // ── Numeric literals ──────────────────────────────────────────────────
+
+    fn lex_number(&mut self, first: char, start: Pos) -> TokenKind {
+        // Detect base prefix
+        if first == '0' {
+            match self.peek() {
+                Some('x') | Some('X') => { self.advance(); return self.lex_int_base(16, start); }
+                Some('o') | Some('O') => { self.advance(); return self.lex_int_base(8,  start); }
+                Some('b') | Some('B') => { self.advance(); return self.lex_int_base(2,  start); }
+                _ => {}
+            }
+        }
+
+        // Decimal integer or float
+        let mut s = String::from(first);
+        self.eat_digits(&mut s, 10);
+
+        let is_float = self.peek() == Some('.') && self.peek2().map_or(false, |c| c.is_ascii_digit())
+            || self.peek() == Some('e') || self.peek() == Some('E');
+
+        if is_float {
+            if self.peek() == Some('.') {
+                s.push('.');
+                self.advance();
+                self.eat_digits(&mut s, 10);
+            }
+            if matches!(self.peek(), Some('e' | 'E')) {
+                s.push('e');
+                self.advance();
+                if matches!(self.peek(), Some('+' | '-')) {
+                    s.push(self.advance().unwrap());
+                }
+                self.eat_digits(&mut s, 10);
+            }
+            // Optional type suffix (f32, f64)
+            self.eat_float_suffix();
+            let span = self.span_from(start);
+            match s.parse::<f64>() {
+                Ok(f)  => TokenKind::FloatLit(f),
+                Err(e) => {
+                    self.errors.push(BmError::InvalidFloatLiteral { span, msg: e.to_string() });
+                    TokenKind::FloatLit(0.0)
+                }
+            }
+        } else {
+            self.eat_int_suffix();
+            let clean: String = s.chars().filter(|&c| c != '_').collect();
+            let span = self.span_from(start);
+            match clean.parse::<u128>() {
+                Ok(n)  => TokenKind::IntLit(n),
+                Err(e) => {
+                    self.errors.push(BmError::InvalidIntLiteral { span, msg: e.to_string() });
+                    TokenKind::IntLit(0)
+                }
+            }
+        }
+    }
+
+    fn lex_int_base(&mut self, base: u32, start: Pos) -> TokenKind {
+        let mut s = String::new();
+        let valid = match base {
+            16 => "0123456789abcdefABCDEF_",
+            8  => "01234567_",
+            2  => "01_",
+            _  => unreachable!(),
+        };
+        while self.peek().map_or(false, |c| valid.contains(c)) {
+            if self.peek() != Some('_') { s.push(self.peek().unwrap()); }
+            self.advance();
+        }
+        self.eat_int_suffix();
+        let span = self.span_from(start);
+        match u128::from_str_radix(&s, base) {
+            Ok(n)  => TokenKind::IntLit(n),
+            Err(e) => {
+                self.errors.push(BmError::InvalidIntLiteral { span, msg: e.to_string() });
+                TokenKind::IntLit(0)
+            }
+        }
+    }
+
+    fn eat_digits(&mut self, buf: &mut String, base: u32) {
+        let valid: &str = match base {
+            16 => "0123456789abcdefABCDEF_",
+            10 => "0123456789_",
+            8  => "01234567_",
+            2  => "01_",
+            _  => unreachable!(),
+        };
+        while self.peek().map_or(false, |c| valid.contains(c)) {
+            let c = self.advance().unwrap();
+            if c != '_' { buf.push(c); }
+        }
+    }
+
+    fn eat_int_suffix(&mut self) {
+        // consume optional type suffix: u8 u16 u32 u64 u128 usize i8 ... isize
+        match self.peek() {
+            Some('u') | Some('i') => {
+                let mut suf = String::new();
+                while matches!(self.peek(), Some(c) if c.is_alphanumeric()) {
+                    suf.push(self.advance().unwrap());
+                }
+                // suffix consumed but not used in this simplified impl
+                let _ = suf;
+            }
+            _ => {}
+        }
+    }
+
+    fn eat_float_suffix(&mut self) {
+        if matches!(self.peek(), Some('f')) {
+            while matches!(self.peek(), Some(c) if c.is_alphanumeric()) {
+                self.advance();
+            }
+        }
+    }
+
+    // ── Identifier, keyword, or macro call ───────────────────────────────
+
+    fn lex_ident_or_keyword(&mut self, first: char, _start: Pos) -> TokenKind {
+        let mut s = String::from(first);
+        while matches!(self.peek(), Some(c) if c.is_alphanumeric() || c == '_') {
+            s.push(self.advance().unwrap());
+        }
+
+        // Macro call: ident!
+        if self.peek() == Some('!') && !matches!(self.peek2(), Some('=')) {
+            self.advance(); // eat '!'
+            return TokenKind::MacroCall(s);
+        }
+
+        // Keyword table
+        match s.as_str() {
+            "fn"       => TokenKind::KwFn,
+            "return"   => TokenKind::KwReturn,
+            "break"    => TokenKind::KwBreak,
+            "continue" => TokenKind::KwContinue,
+            "if"       => TokenKind::KwIf,
+            "else"     => TokenKind::KwElse,
+            "match"    => TokenKind::KwMatch,
+            "while"    => TokenKind::KwWhile,
+            "for"      => TokenKind::KwFor,
+            "in"       => TokenKind::KwIn,
+            "defer"    => TokenKind::KwDefer,
+            "async"    => TokenKind::KwAsync,
+            "await"    => TokenKind::KwAwait,
+            "let"      => TokenKind::KwLet,
+            "var"      => TokenKind::KwVar,
+            "const"    => TokenKind::KwConst,
+            "static"   => TokenKind::KwStatic,
+            "struct"   => TokenKind::KwStruct,
+            "enum"     => TokenKind::KwEnum,
+            "trait"    => TokenKind::KwTrait,
+            "impl"     => TokenKind::KwImpl,
+            "module"   => TokenKind::KwModule,
+            "interface"=> TokenKind::KwInterface,
+            "use"      => TokenKind::KwUse,
+            "mod"      => TokenKind::KwMod,
+            "type"     => TokenKind::KwType,
+            "owned"    => TokenKind::KwOwned,
+            "move"     => TokenKind::KwMove,
+            "copy"     => TokenKind::KwCopy,
+            "drop"     => TokenKind::KwDrop,
+            "linear"   => TokenKind::KwLinear,
+            "borrow"   => TokenKind::KwBorrow,
+            "region"   => TokenKind::KwRegion,
+            "effect"   => TokenKind::KwEffect,
+            "handle"   => TokenKind::KwHandle,
+            "resume"   => TokenKind::KwResume,
+            "actor"    => TokenKind::KwActor,
+            "receive"  => TokenKind::KwReceive,
+            "spawn"    => TokenKind::KwSpawn,
+            "comptime" => TokenKind::KwComptime,
+            "macro"    => TokenKind::KwMacro,
+            "pub"      => TokenKind::KwPub,
+            "priv"     => TokenKind::KwPriv,
+            "extern"   => TokenKind::KwExtern,
+            "unsafe"   => TokenKind::KwUnsafe,
+            "pure"     => TokenKind::KwPure,
+            "total"    => TokenKind::KwTotal,
+            "lazy"     => TokenKind::KwLazy,
+            "atomic"   => TokenKind::KwAtomic,
+            "packed"   => TokenKind::KwPacked,
+            "align"    => TokenKind::KwAlign,
+            "soa"      => TokenKind::KwSoa,
+            "volatile" => TokenKind::KwVolatile,
+            "dispatch" => TokenKind::KwDispatch,
+            "asm"      => TokenKind::KwAsm,
+            "where"    => TokenKind::KwWhere,
+            "as"       => TokenKind::KwAs,
+            "is"       => TokenKind::KwIs,
+            "and"      => TokenKind::KwAnd,
+            "or"       => TokenKind::KwOr,
+            "not"      => TokenKind::KwNot,
+            "true"     => TokenKind::BoolLit(true),
+            "false"    => TokenKind::BoolLit(false),
+            "null"     => TokenKind::KwNull,
+            "self"     => TokenKind::KwSelf,
+            "super"    => TokenKind::KwSuper,
+            "never"    => TokenKind::KwNever,
+            "cap"      => TokenKind::KwCap,
+            // Primitive type keywords
+            "i8"    => TokenKind::KwI8,   "i16"   => TokenKind::KwI16,
+            "i32"   => TokenKind::KwI32,  "i64"   => TokenKind::KwI64,
+            "i128"  => TokenKind::KwI128, "isize" => TokenKind::KwIsize,
+            "int"   => TokenKind::KwInt,
+            "u8"    => TokenKind::KwU8,   "u16"   => TokenKind::KwU16,
+            "u32"   => TokenKind::KwU32,  "u64"   => TokenKind::KwU64,
+            "u128"  => TokenKind::KwU128, "usize" => TokenKind::KwUsize,
+            "uint"  => TokenKind::KwUint,
+            "f16"   => TokenKind::KwF16,  "f32"   => TokenKind::KwF32,
+            "f64"   => TokenKind::KwF64,  "f128"  => TokenKind::KwF128,
+            "bool"  => TokenKind::KwBool,
+            "char"  => TokenKind::KwChar,
+            "str"   => TokenKind::KwStr,
+            "void"  => TokenKind::KwVoid,
+            "byte"  => TokenKind::KwByte,
+            // Anything else is an identifier
+            _ => TokenKind::Ident(s),
+        }
+    }
+}

@@ -1,0 +1,85 @@
+/// BlackMagic — Ownership, Borrowing, and Linear Types
+/// Shows: owned values, references, linear types, defer, RAII
+
+module ownership
+
+use std::io::println
+
+// ── Ownership basics ──────────────────────────────────────────────────────────
+
+struct Point { x: f64, y: f64 }
+
+fn distance(a: &Point, b: &Point) -> f64 {
+    let dx = a.x - b.x
+    let dy = a.y - b.y
+    (dx * dx + dy * dy).sqrt()
+}
+
+// ── Linear type: must be consumed (closed), never dropped silently ────────────
+
+linear struct File {
+    path: str,
+    fd:   i32,
+}
+
+impl File {
+    pub fn open(path: str) -> Result<File, str> !IO {
+        // syscall open()...
+        Ok(File { path, fd: 3 })
+    }
+
+    // Consumes self — linear: compiler ensures this is called
+    pub fn close(self) -> void !IO {
+        println("closing {self.path}")
+        // syscall close(self.fd)...
+    }
+
+    pub fn write(self: &mut File, data: &[u8]) -> usize !IO {
+        // syscall write()...
+        data.len()
+    }
+
+    pub fn read(self: &File, buf: &mut [u8]) -> usize !IO {
+        // syscall read()...
+        0
+    }
+}
+
+// ── Regions: scoped arena allocation ────────────────────────────────────────
+
+fn process_request(data: &[u8]) -> str {
+    region tmp {
+        // Everything allocated inside tmp is freed at closing brace
+        let parsed  = parse_json(data, tmp)
+        let cleaned = sanitise(parsed, tmp)
+        format_response(cleaned)   // lives beyond tmp (heap-allocated)
+    }
+}
+
+fn parse_json(data: &[u8], _alloc: Allocator) -> str { "parsed" }
+fn sanitise(s: str, _alloc: Allocator) -> str { s }
+fn format_response(s: str) -> str { s }
+
+type Allocator = void  // placeholder
+
+// ── Main demonstration ────────────────────────────────────────────────────────
+
+fn main() !IO {
+    // Ownership transfer
+    let p1 = Point { x: 0.0, y: 0.0 }
+    let p2 = Point { x: 3.0, y: 4.0 }
+    println("distance = {distance(&p1, &p2)}")   // borrows p1, p2
+
+    // Both p1 and p2 still valid here (borrow ended)
+    let p3 = p1   // move: p1 is no longer valid
+    // println("{p1.x}")   // ERROR: p1 was moved
+
+    // Linear type with defer (guaranteed close)
+    let f = File::open("/tmp/blackmagic.txt")?
+    defer f.close()
+
+    let mut buf = [0u8; 512]
+    let n = f.read(&mut buf)
+    println("read {n} bytes")
+    // f.close() called here by defer, even if an error occurs
+}

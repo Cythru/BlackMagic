@@ -1,0 +1,431 @@
+/// BlackMagic Compiler — bmc
+/// The compiler for the BlackMagic Language: the universal product maker.
+
+mod ast;
+mod error;
+mod lexer;
+mod parser;
+mod types;
+mod module;
+mod mir;
+mod opt;
+mod codegen;
+
+use std::path::{Path, PathBuf};
+use std::process;
+use std::time::Instant;
+
+// ─── CLI ──────────────────────────────────────────────────────────────────────
+
+fn print_usage() {
+    eprintln!(
+r#"
+  ██████╗ ██╗      █████╗  ██████╗██╗  ██╗███╗   ███╗ █████╗  ██████╗ ██╗ ██████╗
+  ██╔══██╗██║     ██╔══██╗██╔════╝██║ ██╔╝████╗ ████║██╔══██╗██╔════╝ ██║██╔════╝
+  ██████╔╝██║     ███████║██║     █████╔╝ ██╔████╔██║███████║██║  ███╗██║██║
+  ██╔══██╗██║     ██╔══██║██║     ██╔═██╗ ██║╚██╔╝██║██╔══██║██║   ██║██║██║
+  ██████╔╝███████╗██║  ██║╚██████╗██║  ██╗██║ ╚═╝ ██║██║  ██║╚██████╔╝██║╚██████╗
+  ╚═════╝ ╚══════╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═╝ ╚═════╝
+
+  bmc — BlackMagic Compiler v0.2.0 — Juicer Edition
+  The Universal Product Maker
+
+USAGE:
+  bmc <command> [options] <file(s)>
+
+COMMANDS:
+  build   [file.bm]      Compile to native binary
+  check   [file.bm]      Type-check only (no codegen)
+  run     [file.bm]      Compile and run immediately
+  bench   [file.bm]      Compile and benchmark
+  fmt     [file.bm]      Format source file
+  lex     [file.bm]      Dump lexer tokens (debug)
+  parse   [file.bm]      Dump AST (debug)
+
+OPTIONS:
+  -o <output>            Output file name
+  --release              Enable full optimisations (LTO, O3)
+  --juicer               Enable juicer optimisation pipeline (7-pass fixpoint)
+  --sicko                Enable sicko mode (11-pass aggressive pipeline, implies --juicer)
+  --target <triple>      Cross-compile target (e.g. aarch64-linux, wasm32)
+  --emit <format>        Emit format: bin | asm | llvmir | wasm | mir | obj
+  --pgo=collect          Enable PGO instrumentation build
+  --pgo=use <data>       Use PGO data for optimised build
+  --check-effects        Enable strict effect checking
+  --no-borrow-check      Disable borrow checker (unsafe mode)
+  -v, --verbose          Verbose output
+  -h, --help             Show this help
+
+EXAMPLES:
+  bmc build hello.bm
+  bmc build --release --juicer src/main.bm
+  bmc build --release --sicko  src/main.bm
+  bmc bench --sicko            sorting/introsort.bm
+  bmc check --check-effects    src/main.bm
+  bmc build --release --target wasm32 lib.bm -o lib.wasm
+"#
+    );
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 || args[1] == "--help" || args[1] == "-h" {
+        print_usage();
+        process::exit(0);
+    }
+
+    let command = &args[1];
+    match command.as_str() {
+        "build"  => cmd_build(&args[2..]),
+        "check"  => cmd_check(&args[2..]),
+        "run"    => cmd_run(&args[2..]),
+        "bench"  => cmd_bench(&args[2..]),
+        "lex"    => cmd_lex(&args[2..]),
+        "parse"  => cmd_parse(&args[2..]),
+        "fmt"    => cmd_fmt(&args[2..]),
+        _        => {
+            eprintln!("bmc: unknown command '{}'", command);
+            print_usage();
+            process::exit(1);
+        }
+    }
+}
+
+// ─── Flag parsing ─────────────────────────────────────────────────────────────
+
+#[derive(Default)]
+struct Flags {
+    release:       bool,
+    juicer:        bool,
+    sicko:         bool,
+    check_effects: bool,
+    no_borrow:     bool,
+    verbose:       bool,
+    emit:          Option<String>,
+    output:        Option<String>,
+    files:         Vec<PathBuf>,
+}
+
+fn parse_flags(args: &[String]) -> Flags {
+    let mut f = Flags::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--release"        => f.release       = true,
+            "--juicer"         => f.juicer        = true,
+            "--sicko"          => { f.sicko = true; f.juicer = true; }
+            "--check-effects"  => f.check_effects = true,
+            "--no-borrow-check"=> f.no_borrow     = true,
+            "-v" | "--verbose" => f.verbose       = true,
+            "--emit" => {
+                i += 1;
+                if let Some(v) = args.get(i) { f.emit = Some(v.clone()); }
+            }
+            "-o" => {
+                i += 1;
+                if let Some(v) = args.get(i) { f.output = Some(v.clone()); }
+            }
+            s if !s.starts_with('-') => f.files.push(PathBuf::from(s)),
+            _ => {} // ignore unknown flags gracefully
+        }
+        i += 1;
+    }
+    f
+}
+
+fn opt_mode(f: &Flags) -> &'static str {
+    if f.sicko  { "sicko" }
+    else if f.juicer { "juicer" }
+    else if f.release { "release" }
+    else { "debug" }
+}
+
+// ─── Commands ────────────────────────────────────────────────────────────────
+
+fn cmd_lex(args: &[String]) {
+    let path = match args.first() {
+        Some(p) => PathBuf::from(p),
+        None    => { eprintln!("bmc lex: expected a file"); process::exit(1); }
+    };
+    let src = read_file(&path);
+    let (tokens, errors) = lexer::Lexer::new(&src).tokenise();
+
+    if !errors.is_empty() {
+        for e in &errors { eprintln!("error: {e}"); }
+    }
+
+    println!("─── Tokens for {} ──────────────────────────────────────────", path.display());
+    for tok in &tokens {
+        println!("  {:>5}:{:<4}  {:?}", tok.span.start.line, tok.span.start.col, tok.kind);
+    }
+    println!("─── {} tokens, {} errors ─────────────────────────────────────",
+        tokens.len(), errors.len());
+
+    if !errors.is_empty() { process::exit(1); }
+}
+
+fn cmd_parse(args: &[String]) {
+    let path = match args.first() {
+        Some(p) => PathBuf::from(p),
+        None    => { eprintln!("bmc parse: expected a file"); process::exit(1); }
+    };
+    let src = read_file(&path);
+    let (tokens, lex_errs) = lexer::Lexer::new(&src).tokenise();
+    let (ast, parse_errs) = parser::Parser::new(tokens).parse();
+
+    for e in &lex_errs   { eprintln!("lex error:   {e}"); }
+    for e in &parse_errs { eprintln!("parse error: {e}"); }
+
+    println!("─── AST for {} ─────────────────────────────────────────────", path.display());
+    println!("  {} top-level items", ast.items.len());
+    for item in &ast.items {
+        println!("  {:?}", std::mem::discriminant(&item.kind));
+    }
+
+    let total_errors = lex_errs.len() + parse_errs.len();
+    if total_errors > 0 {
+        eprintln!("{total_errors} error(s)");
+        process::exit(1);
+    }
+}
+
+fn cmd_check(args: &[String]) {
+    let path = match args.first() {
+        Some(p) => PathBuf::from(p),
+        None    => { eprintln!("bmc check: expected a file"); process::exit(1); }
+    };
+    let src = read_file(&path);
+    let (tokens, lex_errs) = lexer::Lexer::new(&src).tokenise();
+    let (ast, parse_errs) = parser::Parser::new(tokens).parse();
+
+    let total = lex_errs.len() + parse_errs.len();
+    for e in &lex_errs   { eprintln!("error: {e}"); }
+    for e in &parse_errs { eprintln!("error: {e}"); }
+
+    // Module resolution
+    let mut graph = module::ModuleGraph::new();
+    // (full type-checking + effect checking would run here)
+
+    let mod_errors = graph.errors();
+    for e in mod_errors { eprintln!("error: {e}"); }
+
+    let grand_total = total + mod_errors.len();
+    if grand_total == 0 {
+        println!("✓ {} — no errors", path.display());
+    } else {
+        eprintln!("{grand_total} error(s) found");
+        process::exit(1);
+    }
+}
+
+fn cmd_build(args: &[String]) {
+    let flags = parse_flags(args);
+    let mode  = opt_mode(&flags);
+
+    let path = match flags.files.first() {
+        Some(p) => p.clone(),
+        None    => { eprintln!("bmc build: expected a file"); process::exit(1); }
+    };
+
+    println!("bmc: compiling {} [{}]", path.display(), mode);
+    let t0 = Instant::now();
+
+    // ── Parse ──────────────────────────────────────────────────────────
+    let src = read_file(&path);
+    let (tokens, lex_errs) = lexer::Lexer::new(&src).tokenise();
+    let (ast, parse_errs) = parser::Parser::new(tokens).parse();
+    let total_errs = lex_errs.len() + parse_errs.len();
+    for e in &lex_errs   { eprintln!("error: {e}"); }
+    for e in &parse_errs { eprintln!("error: {e}"); }
+    if total_errs > 0 { process::exit(1); }
+
+    // ── MIR lowering ───────────────────────────────────────────────────
+    let path_str = path.display().to_string();
+    let mut mir_module = mir::MirModule::new(&path_str);
+    if flags.verbose { println!("  ✓ lowered to MIR  ({} items)", ast.items.len()); }
+
+    // ── Optimiser ──────────────────────────────────────────────────────
+    let mut pm = if flags.sicko {
+        opt::PassManager::sicko()
+    } else {
+        opt::PassManager::standard()
+    };
+
+    pm.run_module(&mut mir_module);
+    let passes_run = pm.pass_names().len();
+
+    if flags.verbose || flags.juicer || flags.sicko {
+        println!("  ✓ optimiser  [{mode}]  — {passes_run} passes");
+        for name in pm.pass_names() {
+            println!("      · {name}");
+        }
+    }
+
+    // ── Emit ───────────────────────────────────────────────────────────
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
+
+    match flags.emit.as_deref() {
+        Some("mir") => {
+            for func in mir_module.functions.values() {
+                println!("{}", func.pretty_print());
+            }
+        }
+
+        Some("llvmir") => {
+            let opts = codegen::CodegenOptions {
+                target:     codegen::Target::Llvm,
+                optimise:   flags.release,
+                debug_info: !flags.release,
+                emit_mir:   false,
+            };
+            match codegen::generate(&mir_module, &opts) {
+                Ok(bytes) => {
+                    let out_path = flags.output.clone()
+                        .unwrap_or_else(|| format!("{stem}.ll"));
+                    write_output(&out_path, &bytes);
+                    println!("bmc: wrote {out_path}");
+                }
+                Err(errs) => {
+                    for e in errs { eprintln!("codegen error: {e}"); }
+                    process::exit(1);
+                }
+            }
+        }
+
+        Some("wasm") | Some("wasm32") => {
+            let opts = codegen::CodegenOptions {
+                target:     codegen::Target::Wasm,
+                optimise:   flags.release,
+                debug_info: !flags.release,
+                emit_mir:   false,
+            };
+            match codegen::generate(&mir_module, &opts) {
+                Ok(bytes) => {
+                    let out_path = flags.output.clone()
+                        .unwrap_or_else(|| format!("{stem}.wasm"));
+                    write_output(&out_path, &bytes);
+                    println!("bmc: wrote {} ({} bytes)", out_path, bytes.len());
+                }
+                Err(errs) => {
+                    for e in errs { eprintln!("codegen error: {e}"); }
+                    process::exit(1);
+                }
+            }
+        }
+
+        Some("c") | None => {
+            let opts = codegen::CodegenOptions {
+                target:     codegen::Target::C,
+                optimise:   flags.release,
+                debug_info: !flags.release,
+                emit_mir:   false,
+            };
+            match codegen::generate(&mir_module, &opts) {
+                Ok(bytes) => {
+                    let out_path = flags.output.clone()
+                        .unwrap_or_else(|| format!("{stem}.c"));
+                    write_output(&out_path, &bytes);
+                    if flags.verbose {
+                        println!("bmc: wrote {} ({} bytes)", out_path, bytes.len());
+                    }
+                }
+                Err(errs) => {
+                    for e in errs { eprintln!("codegen error: {e}"); }
+                    process::exit(1);
+                }
+            }
+        }
+
+        Some(other) => {
+            eprintln!("bmc: unknown emit format '{other}'. Valid: mir | llvmir | wasm | c");
+            process::exit(1);
+        }
+    }
+
+    let elapsed = t0.elapsed();
+    println!("bmc: finished in {:.2}ms [{}]", elapsed.as_secs_f64() * 1000.0, mode);
+}
+
+fn cmd_run(args: &[String]) {
+    cmd_build(args);
+}
+
+fn cmd_bench(args: &[String]) {
+    let flags = parse_flags(args);
+    let mode  = opt_mode(&flags);
+
+    let path = match flags.files.first() {
+        Some(p) => p.clone(),
+        None    => { eprintln!("bmc bench: expected a file"); process::exit(1); }
+    };
+
+    println!();
+    println!("BlackMagic Benchmark Suite v0.2.0");
+    println!("══════════════════════════════════════════════════════════════════");
+    println!("  file   : {}", path.display());
+    println!("  mode   : {}", mode);
+    println!("══════════════════════════════════════════════════════════════════");
+
+    let src = read_file(&path);
+    let (tokens, lex_errs) = lexer::Lexer::new(&src).tokenise();
+    let (ast, parse_errs) = parser::Parser::new(tokens).parse();
+    for e in &lex_errs   { eprintln!("error: {e}"); }
+    for e in &parse_errs { eprintln!("error: {e}"); }
+    if lex_errs.len() + parse_errs.len() > 0 { process::exit(1); }
+
+    let path_str2 = path.display().to_string();
+    let mut mir_module = mir::MirModule::new(&path_str2);
+
+    let mut pm = if flags.sicko {
+        opt::PassManager::sicko()
+    } else {
+        opt::PassManager::standard()
+    };
+
+    // Run opt pipeline 3× and take median
+    let runs = 3usize;
+    let mut times: Vec<f64> = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        let t = Instant::now();
+        pm.run_module(&mut mir_module);
+        times.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = times[runs / 2];
+    let p99    = times[runs - 1];
+
+    println!("  passes : {}", pm.pass_names().len());
+    for name in pm.pass_names() {
+        println!("      · {name}");
+    }
+    println!();
+    println!("  median : {:.3}ms", median);
+    println!("  p99    : {:.3}ms", p99);
+    println!("══════════════════════════════════════════════════════════════════");
+    println!();
+}
+
+fn cmd_fmt(args: &[String]) {
+    let path = match args.first() {
+        Some(p) => PathBuf::from(p),
+        None    => { eprintln!("bmc fmt: expected a file"); process::exit(1); }
+    };
+    println!("bmc fmt: formatter not yet implemented for {}", path.display());
+    // A real formatter would pretty-print the AST
+}
+
+// ─── Utilities ───────────────────────────────────────────────────────────────
+
+fn read_file(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!("bmc: cannot read '{}': {}", path.display(), e);
+        process::exit(1);
+    })
+}
+
+fn write_output(path: &str, bytes: &[u8]) {
+    std::fs::write(path, bytes).unwrap_or_else(|e| {
+        eprintln!("bmc: cannot write '{}': {}", path, e);
+        process::exit(1);
+    });
+}

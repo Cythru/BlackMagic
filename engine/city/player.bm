@@ -1,0 +1,178 @@
+/// BlackMagic Engine — city/player.bm
+///
+/// Player controller for Oracle City.
+/// Handles first-person movement, collision with the tile map, and
+/// building interaction.
+
+use engine::core::math::{ Vec2, clampf, fabsf, sin, cos, PI };
+use engine::input::event::{ InputState, Key };
+use engine::city::map::{ CityMap, BuildingKind };
+use engine::renderer::raycast::{ RayCamera };
+
+// ─── PlayerStats (live game data, injected from Bitburner) ────────────────
+
+pub struct PlayerStats {
+    pub money:       f64,
+    pub hack_level:  u32,
+    pub karma:       f64,
+    pub city:        str,
+    pub in_gang:     bool,
+    pub has_corp:    bool,
+}
+
+impl PlayerStats {
+    pub fn zero() -> PlayerStats {
+        PlayerStats {
+            money: 0.0, hack_level: 1, karma: 0.0,
+            city: "Sector-12", in_gang: false, has_corp: false,
+        }
+    }
+}
+
+// ─── InteractState ────────────────────────────────────────────────────────
+
+pub enum InteractState {
+    None,
+    NearBuilding { kind: BuildingKind },
+    InsideBuilding { kind: BuildingKind, scroll: f32 },
+}
+
+// ─── Player ───────────────────────────────────────────────────────────────
+
+pub const MOVE_SPEED:   f32 = 3.0;   // tiles per second
+pub const STRAFE_SPEED: f32 = 2.5;
+pub const ROT_SPEED:    f32 = 2.0;   // radians per second (keyboard)
+pub const MOUSE_SENS:   f32 = 0.003; // radians per pixel
+pub const INTERACT_DIST: f32 = 1.5;  // tiles — how close to enter building
+
+pub struct Player {
+    pub camera:   RayCamera,
+    pub stats:    PlayerStats,
+    pub interact: InteractState,
+    pub map_mode: bool,   // top-down view
+}
+
+impl Player {
+    pub fn new(start_pos: Vec2) -> Player {
+        Player {
+            camera:   RayCamera::new(start_pos),
+            stats:    PlayerStats::zero(),
+            interact: InteractState::None,
+            map_mode: false,
+        }
+    }
+
+    // ── Input update ──────────────────────────────────────────────────────
+
+    pub fn update(self: &var Player, input: &InputState, map: &CityMap, dt: f32) {
+        // Handle being inside a building (consume input before movement)
+        match &self.interact {
+            InteractState::InsideBuilding { kind, scroll } => {
+                if input.is_key_held(101u8) || input.is_key_held(27) /* ESC */ {
+                    self.interact = InteractState::None;
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        // Mouse look
+        let mouse_delta = input.mouse_delta();
+        self.camera.angle += mouse_delta.x * MOUSE_SENS;
+
+        // Keyboard rotation fallback
+        if input.is_key_held(113u8) { self.camera.angle -= ROT_SPEED * dt; }
+        if input.is_key_held(101u8) {
+            // Interact with building
+            match &self.interact {
+                InteractState::NearBuilding { kind } => {
+                    let k = *kind;
+                    self.interact = InteractState::InsideBuilding { kind: k, scroll: 0.0 };
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // Movement
+        let dir   = Vec2 { x: cos(self.camera.angle), y: sin(self.camera.angle) };
+        let perp  = Vec2 { x: -dir.y, y: dir.x };
+        var move_vec = Vec2::zero();
+
+        if input.is_key_held(119) { move_vec = move_vec.add(dir.scale(MOVE_SPEED * dt));   }
+        if input.is_key_held(115) { move_vec = move_vec.add(dir.scale(-MOVE_SPEED * dt));  }
+        if input.is_key_held(97) { move_vec = move_vec.add(perp.scale(-STRAFE_SPEED * dt)); }
+        if input.is_key_held(100) { move_vec = move_vec.add(perp.scale( STRAFE_SPEED * dt)); }
+
+        // Slide collision (try X and Y separately)
+        let new_x = Vec2 { x: self.camera.pos.x + move_vec.x, y: self.camera.pos.y };
+        if !map_solid_at(map, new_x) {
+            self.camera.pos.x = new_x.x;
+        }
+        let new_y = Vec2 { x: self.camera.pos.x, y: self.camera.pos.y + move_vec.y };
+        if !map_solid_at(map, new_y) {
+            self.camera.pos.y = new_y.y;
+        }
+
+        // Clamp to map bounds
+        self.camera.pos.x = clampf(self.camera.pos.x, 0.5, (map.width  - 1) as f32 - 0.5);
+        self.camera.pos.y = clampf(self.camera.pos.y, 0.5, (map.height - 1) as f32 - 0.5);
+
+        // Check for nearby interactable building
+        self.update_interact(map);
+
+        // Tab: toggle map mode
+        // (handled externally via single-press detection in main loop)
+    }
+
+    fn update_interact(self: &var Player, map: &CityMap) {
+        // Cast a short ray forward to find nearby building
+        let dir = Vec2 { x: cos(self.camera.angle), y: sin(self.camera.angle) };
+        let probe = self.camera.pos.add(dir.scale(INTERACT_DIST));
+
+        match map.building_at(probe) {
+            Some(kind) => {
+                self.interact = InteractState::NearBuilding { kind: *kind };
+            }
+            None => {
+                match &self.interact {
+                    InteractState::NearBuilding { .. } => {
+                        self.interact = InteractState::None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    pub fn facing_tile(self: &Player) -> Vec2 {
+        let dir = Vec2 { x: cos(self.camera.angle), y: sin(self.camera.angle) };
+        self.camera.pos.add(dir.scale(INTERACT_DIST))
+    }
+}
+
+// ─── Map collision helpers ────────────────────────────────────────────────
+
+pub fn map_solid_at(map: &CityMap, pos: Vec2) -> bool {
+    let margin = 0.2f32;
+    // Check 4 corners of player body
+    let offsets: [Vec2; 4] = [
+        Vec2::new( margin,  margin),
+        Vec2::new(-margin,  margin),
+        Vec2::new( margin, -margin),
+        Vec2::new(-margin, -margin),
+    ];
+    var i: usize = 0;
+    while i < 4 {
+        let p = pos.add(offsets[i]);
+        let tx = p.x as i32;
+        let ty = p.y as i32;
+        if tx < 0 || ty < 0 { return true; }
+        let tx = tx as u32;
+        let ty = ty as u32;
+        if tx >= map.width || ty >= map.height { return true; }
+        if map.tile_at(tx, ty).kind.is_solid() { return true; }
+        i += 1;
+    }
+    false
+}

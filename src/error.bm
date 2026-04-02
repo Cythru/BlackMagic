@@ -1,0 +1,173 @@
+/// BlackMagic compiler error types and reporting.
+use std::fmt;
+
+/// A position in source code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Pos {
+    pub line: u32,
+    pub col:  u32,
+    pub byte: u32,
+}
+
+impl Pos {
+    pub const ZERO: Self = Self { line: 1, col: 1, byte: 0 };
+}
+
+impl fmt::Display for Pos {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.line, self.col)
+    }
+}
+
+/// A span (start..end) in source code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Span {
+    pub start: Pos,
+    pub end:   Pos,
+}
+
+impl Default for Span {
+    fn default() -> Self {
+        Span { start: Pos::ZERO, end: Pos::ZERO }
+    }
+}
+
+impl Span {
+    pub fn new(start: Pos, end: Pos) -> Self { Self { start, end } }
+
+    pub fn merge(self, other: Span) -> Span {
+        Span {
+            start: if self.start.byte <= other.start.byte { self.start } else { other.start },
+            end:   if self.end.byte   >= other.end.byte   { self.end   } else { other.end   },
+        }
+    }
+}
+
+impl fmt::Display for Span {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}-{}", self.start, self.end)
+    }
+}
+
+/// All errors the compiler can produce.
+#[derive(Debug, Clone)]
+pub enum BmError {
+    // ─── Lexer errors ───────────────────────────────────────────────────────
+    UnexpectedChar { ch: char, pos: Pos },
+    UnterminatedString { start: Pos },
+    UnterminatedComment { start: Pos },
+    InvalidEscape { ch: char, pos: Pos },
+    InvalidUnicodeEscape { span: Span },
+    InvalidIntLiteral { span: Span, msg: String },
+    InvalidFloatLiteral { span: Span, msg: String },
+    OverflowLiteral { span: Span, ty: &'static str },
+
+    // ─── Parser errors ──────────────────────────────────────────────────────
+    UnexpectedToken { span: Span, found: String, expected: String },
+    UnexpectedEof { pos: Pos, expected: String },
+    DuplicateModifier { span: Span, modifier: String },
+    InvalidAttribute { span: Span, msg: String },
+    MissingReturnType { span: Span },
+
+    // ─── Module errors ──────────────────────────────────────────────────────
+    ModuleNotFound { span: Span, path: String },
+    CircularDependency { cycle: Vec<String> },
+    DuplicateExport { span: Span, name: String, first: Span },
+    UnresolvedImport { span: Span, path: String },
+
+    // ─── Type errors ────────────────────────────────────────────────────────
+    TypeMismatch { span: Span, expected: String, found: String },
+    UndefinedVariable { span: Span, name: String },
+    UndefinedType { span: Span, name: String },
+    UndefinedField { span: Span, ty: String, field: String },
+    UndefinedMethod { span: Span, ty: String, method: String },
+    ArityMismatch { span: Span, expected: usize, found: usize },
+    BorrowError { span: Span, msg: String },
+    LinearTypeError { span: Span, msg: String },
+    EffectError { span: Span, msg: String },
+    RefinementViolation { span: Span, msg: String },
+    NonExhaustiveMatch { span: Span, missing: Vec<String> },
+
+    // ─── Compile-time evaluation errors ────────────────────────────────────
+    ComptimeError { span: Span, msg: String },
+
+    // ─── Code generation errors ─────────────────────────────────────────────
+    UnsupportedTarget { feature: String, target: String },
+    InternalError { msg: String },
+}
+
+impl fmt::Display for BmError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BmError::UnexpectedChar { ch, pos } =>
+                write!(f, "{pos}: unexpected character '{ch}'"),
+            BmError::UnterminatedString { start } =>
+                write!(f, "{start}: unterminated string literal"),
+            BmError::UnterminatedComment { start } =>
+                write!(f, "{start}: unterminated block comment"),
+            BmError::InvalidEscape { ch, pos } =>
+                write!(f, "{pos}: invalid escape sequence '\\{ch}'"),
+            BmError::InvalidUnicodeEscape { span } =>
+                write!(f, "{span}: invalid unicode escape"),
+            BmError::InvalidIntLiteral { span, msg } =>
+                write!(f, "{span}: invalid integer literal: {msg}"),
+            BmError::InvalidFloatLiteral { span, msg } =>
+                write!(f, "{span}: invalid float literal: {msg}"),
+            BmError::OverflowLiteral { span, ty } =>
+                write!(f, "{span}: literal overflows type {ty}"),
+
+            BmError::UnexpectedToken { span, found, expected } =>
+                write!(f, "{span}: expected {expected}, found {found}"),
+            BmError::UnexpectedEof { pos, expected } =>
+                write!(f, "{pos}: unexpected end of file, expected {expected}"),
+            BmError::DuplicateModifier { span, modifier } =>
+                write!(f, "{span}: duplicate modifier '{modifier}'"),
+            BmError::InvalidAttribute { span, msg } =>
+                write!(f, "{span}: invalid attribute: {msg}"),
+            BmError::MissingReturnType { span } =>
+                write!(f, "{span}: missing return type annotation"),
+
+            BmError::ModuleNotFound { span, path } =>
+                write!(f, "{span}: module not found: {path}"),
+            BmError::CircularDependency { cycle } =>
+                write!(f, "circular module dependency: {}", cycle.join(" → ")),
+            BmError::DuplicateExport { span, name, first } =>
+                write!(f, "{span}: '{name}' already exported at {first}"),
+            BmError::UnresolvedImport { span, path } =>
+                write!(f, "{span}: unresolved import: {path}"),
+
+            BmError::TypeMismatch { span, expected, found } =>
+                write!(f, "{span}: type mismatch — expected {expected}, found {found}"),
+            BmError::UndefinedVariable { span, name } =>
+                write!(f, "{span}: undefined variable '{name}'"),
+            BmError::UndefinedType { span, name } =>
+                write!(f, "{span}: undefined type '{name}'"),
+            BmError::UndefinedField { span, ty, field } =>
+                write!(f, "{span}: type '{ty}' has no field '{field}'"),
+            BmError::UndefinedMethod { span, ty, method } =>
+                write!(f, "{span}: type '{ty}' has no method '{method}'"),
+            BmError::ArityMismatch { span, expected, found } =>
+                write!(f, "{span}: expected {expected} arguments, found {found}"),
+            BmError::BorrowError { span, msg } =>
+                write!(f, "{span}: borrow checker: {msg}"),
+            BmError::LinearTypeError { span, msg } =>
+                write!(f, "{span}: linear type error: {msg}"),
+            BmError::EffectError { span, msg } =>
+                write!(f, "{span}: effect error: {msg}"),
+            BmError::RefinementViolation { span, msg } =>
+                write!(f, "{span}: refinement type violation: {msg}"),
+            BmError::NonExhaustiveMatch { span, missing } =>
+                write!(f, "{span}: non-exhaustive match — missing: {}", missing.join(", ")),
+
+            BmError::ComptimeError { span, msg } =>
+                write!(f, "{span}: comptime error: {msg}"),
+
+            BmError::UnsupportedTarget { feature, target } =>
+                write!(f, "feature '{feature}' not supported on target '{target}'"),
+            BmError::InternalError { msg } =>
+                write!(f, "internal compiler error: {msg}"),
+        }
+    }
+}
+
+pub type BmResult<T> = Result<T, Vec<BmError>>;

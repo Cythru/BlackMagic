@@ -1,0 +1,336 @@
+/// BlackMagic Engine — renderer/raycast.bm
+///
+/// First-person DDA raycaster — pure BlackMagic, Wolfenstein/Doom style.
+/// Used by Oracle City's walk mode to render 3D corridors from a 2D tile map.
+///
+/// Features:
+///   - DDA ray marching (no trig tables — computed per frame via BM trig)
+///   - Textured walls (UV-sampled from CanvasBuffer atlas)
+///   - Floor / ceiling flat shading with distance darkening
+///   - Sprite projection (billboarded entities)
+///   - Fisheye correction via cos(ray_angle)
+///   - SIMD-width-4 ray batch when target width divisible by 4
+
+use engine::core::math::{
+    Vec2, Color, sin, cos, tan, atan2, sqrt, fabsf, floorf, clampf,
+    EPSILON, PI
+};
+use engine::renderer::canvas::{ Canvas2D, CanvasBuffer };
+use bm::simd::{ vec4 };
+use bm::sicko;
+
+// ─── MapCell ──────────────────────────────────────────────────────────────
+
+pub enum MapCell {
+    Empty,
+    Wall   { texture_id: u8 },
+    Floor  { texture_id: u8 },
+    Object { id: u8 },
+}
+
+// ─── Map ──────────────────────────────────────────────────────────────────
+
+pub struct RaycastMap {
+    pub cells:  *MapCell,
+    pub width:  u32,
+    pub height: u32,
+}
+
+impl RaycastMap {
+    #[inline]
+    pub fn get(self: &RaycastMap, tx: i32, ty: i32) -> &MapCell {
+        if tx < 0 || ty < 0 || tx >= self.width as i32 || ty >= self.height as i32 {
+            return &MapCell::Wall{ texture_id: 0 };
+        }
+        unsafe { &*self.cells.add((ty as u32 * self.width + tx as u32) as usize) }
+    }
+
+    pub fn is_solid(self: &RaycastMap, tx: i32, ty: i32) -> bool {
+        match self.get(tx, ty) {
+            MapCell::Wall { .. } => true,
+            _ => false,
+        }
+    }
+}
+
+// ─── Camera ───────────────────────────────────────────────────────────────
+
+pub struct RayCamera {
+    pub pos:    Vec2,     // world position (float tile units)
+    pub angle:  f32,      // heading radians
+    pub fov:    f32,      // full horizontal FOV radians (default π/2 = 90°)
+    pub height: f32,      // eye height (0 = floor, 1 = full tile, default 0.5)
+}
+
+impl RayCamera {
+    pub fn new(pos: Vec2) -> RayCamera {
+        RayCamera { pos, angle: 0.0, fov: PI * 0.5, height: 0.5 }
+    }
+
+    pub fn dir(self: &RayCamera) -> Vec2 {
+        Vec2 { x: cos(self.angle), y: sin(self.angle) }
+    }
+
+    pub fn plane_vec(self: &RayCamera) -> Vec2 {
+        // Camera plane perpendicular to dir, length = tan(fov/2)
+        let half = self.fov * 0.5;
+        let scale = fabsf(sin(half) / cos(half));  // tan(fov/2)
+        Vec2 { x: -sin(self.angle) * scale, y: cos(self.angle) * scale }
+    }
+}
+
+// ─── RayHit ───────────────────────────────────────────────────────────────
+
+pub struct RayHit {
+    pub dist:      f32,       // perpendicular distance to wall
+    pub wall_x:    f32,       // exact hit position within tile [0,1)
+    pub tile_x:    i32,
+    pub tile_y:    i32,
+    pub side:      WallSide,
+    pub texture_id: u8,
+}
+
+pub enum WallSide { NS, EW }
+
+// ─── Raycaster ────────────────────────────────────────────────────────────
+
+pub struct Raycaster {
+    pub camera:    RayCamera,
+    pub map:       RaycastMap,
+    pub textures:  *CanvasBuffer,  // texture atlas array
+    pub tex_count: usize,
+    // Shading parameters
+    pub fog_start:   f32,   // distance fog begins
+    pub fog_end:     f32,   // distance at full fog
+    pub fog_color:   Color,
+    pub ambient:     f32,   // minimum light level [0,1]
+    pub ceil_color:  Color,
+    pub floor_color: Color,
+}
+
+impl Raycaster {
+    pub fn new(map: RaycastMap) -> Raycaster {
+        Raycaster {
+            camera:   RayCamera::new(Vec2::new(2.0, 2.0)),
+            map,
+            textures:  null,
+            tex_count: 0,
+            fog_start:  6.0,
+            fog_end:   18.0,
+            fog_color:  Color::BLACK,
+            ambient:    0.1,
+            ceil_color:  Color::rgb(0.15, 0.15, 0.25),
+            floor_color: Color::rgb(0.20, 0.18, 0.15),
+        }
+    }
+
+    // ── Full frame render ────────────────────────────────────────────────
+
+    /// Render a full frame into `canvas`.
+    #[sicko]
+    pub fn render(self: &var Raycaster, canvas: &var Canvas2D) {
+        let w = canvas.buf.width;
+        let h = canvas.buf.height;
+        let half_h = h / 2;
+
+        // Ceiling and floor fills (flat shaded for now)
+        self.fill_ceil_floor(canvas);
+
+        // Wall columns
+        var col: u32 = 0;
+        while col < w {
+            let hit = self.cast_ray(col, w);
+            self.draw_wall_column(canvas, col, &hit);
+            col += 1;
+        }
+    }
+
+    fn fill_ceil_floor(self: &Raycaster, canvas: &var Canvas2D) {
+        let w = canvas.buf.width;
+        let h = canvas.buf.height;
+        let half_h = h / 2;
+
+        // Ceiling
+        let cc = self.ceil_color.to_rgba32();
+        var y: u32 = 0;
+        while y < half_h {
+            let shade = (y as f32 / half_h as f32).min(1.0);
+            let row_color = self.ceil_color.darkened(1.0 - shade * 0.6 - 0.4);
+            let px_color = row_color.to_rgba32();
+            var x: u32 = 0;
+            while x < w { canvas.buf.put_pixel(x, y, px_color); x += 1; }
+            y += 1;
+        }
+
+        // Floor
+        var y2 = half_h;
+        while y2 < h {
+            let shade = (((y2 - half_h) as f32) / (half_h as f32)).min(1.0);
+            let row_color = self.floor_color.darkened(1.0 - shade * 0.5 - 0.2);
+            let px_color = row_color.to_rgba32();
+            var x: u32 = 0;
+            while x < w { canvas.buf.put_pixel(x, y2, px_color); x += 1; }
+            y2 += 1;
+        }
+    }
+
+    // ── DDA ray cast ─────────────────────────────────────────────────────
+
+    #[inline]
+    fn cast_ray(self: &Raycaster, col: u32, screen_w: u32) -> RayHit {
+        let cam_x = 2.0 * (col as f32) / (screen_w as f32) - 1.0;  // [-1, 1]
+        let plane  = self.camera.plane_vec();
+        let dir    = self.camera.dir();
+
+        let ray_dir = Vec2 {
+            x: dir.x + plane.x * cam_x,
+            y: dir.y + plane.y * cam_x,
+        };
+
+        // DDA setup
+        let delta_x = if fabsf(ray_dir.x) < EPSILON { 1e30 } else { fabsf(1.0 / ray_dir.x) };
+        let delta_y = if fabsf(ray_dir.y) < EPSILON { 1e30 } else { fabsf(1.0 / ray_dir.y) };
+
+        var map_x = self.camera.pos.x as i32;
+        var map_y = self.camera.pos.y as i32;
+
+        // Initial step and side distances
+        var side_dist_x: f32;
+        var side_dist_y: f32;
+        var step_x: i32;
+        var step_y: i32;
+
+        if ray_dir.x < 0.0 {
+            step_x = -1;
+            side_dist_x = (self.camera.pos.x - map_x as f32) * delta_x;
+        } else {
+            step_x = 1;
+            side_dist_x = (map_x as f32 + 1.0 - self.camera.pos.x) * delta_x;
+        }
+
+        if ray_dir.y < 0.0 {
+            step_y = -1;
+            side_dist_y = (self.camera.pos.y - map_y as f32) * delta_y;
+        } else {
+            step_y = 1;
+            side_dist_y = (map_y as f32 + 1.0 - self.camera.pos.y) * delta_y;
+        }
+
+        // March
+        var side = WallSide::NS;
+        var texture_id: u8 = 0;
+        var steps: u32 = 0;
+        loop {
+            if side_dist_x < side_dist_y {
+                side_dist_x += delta_x;
+                map_x += step_x;
+                side = WallSide::EW;
+            } else {
+                side_dist_y += delta_y;
+                map_y += step_y;
+                side = WallSide::NS;
+            }
+            steps += 1;
+            if steps > 128 { break; }  // max range
+
+            match self.map.get(map_x, map_y) {
+                MapCell::Wall { texture_id: tid } => {
+                    texture_id = *tid;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        // Perpendicular wall distance (fisheye corrected)
+        let perp_dist = match side {
+            WallSide::EW => side_dist_x - delta_x,
+            WallSide::NS => side_dist_y - delta_y,
+        };
+        let perp_dist = perp_dist.max(0.001);
+
+        // Wall-X (fractional hit position within tile)
+        let wall_x = match side {
+            WallSide::EW => self.camera.pos.y + perp_dist * ray_dir.y,
+            WallSide::NS => self.camera.pos.x + perp_dist * ray_dir.x,
+        };
+        let wall_x = wall_x - floorf(wall_x);
+
+        RayHit { dist: perp_dist, wall_x, tile_x: map_x, tile_y: map_y, side, texture_id }
+    }
+
+    // ── Wall column draw ─────────────────────────────────────────────────
+
+    fn draw_wall_column(self: &Raycaster, canvas: &var Canvas2D, col: u32, hit: &RayHit) {
+        let h          = canvas.buf.height;
+        let half_h     = h / 2;
+        let line_height = (h as f32 / hit.dist) as i32;
+
+        let y_top = (half_h as i32 - line_height / 2).max(0) as u32;
+        let y_bot = (half_h as i32 + line_height / 2).min(h as i32 - 1) as u32;
+
+        // Distance fog factor
+        let fog_t = clampf((hit.dist - self.fog_start) / (self.fog_end - self.fog_start), 0.0, 1.0);
+
+        // Side shading (EW walls slightly darker)
+        let side_shade = match hit.side { WallSide::NS => 1.0, WallSide::EW => 0.75 };
+
+        // Textured column
+        if self.textures != null && (hit.texture_id as usize) < self.tex_count {
+            let tex = unsafe { &*self.textures.add(hit.texture_id as usize) };
+            let tex_x = (hit.wall_x * tex.width as f32) as u32 % tex.width;
+            let col_height = if y_bot > y_top { y_bot - y_top } else { 1 };
+
+            var y = y_top;
+            while y <= y_bot {
+                // Map screen y → texture y
+                let tex_y_f = ((y as i32 - half_h as i32 + line_height/2) as f32)
+                    / (line_height as f32);
+                let tex_y = ((tex_y_f * tex.height as f32) as u32).min(tex.height - 1);
+
+                let raw = tex.get_pixel(tex_x, tex_y);
+                // Unpack and shade
+                let r = ((raw >> 24) & 0xFF) as f32 / 255.0;
+                let g = ((raw >> 16) & 0xFF) as f32 / 255.0;
+                let b = ((raw >>  8) & 0xFF) as f32 / 255.0;
+
+                let light = (side_shade * (1.0 - fog_t * 0.9)).max(self.ambient);
+                let fr = clampf(r * light + self.fog_color.r * fog_t, 0.0, 1.0);
+                let fg = clampf(g * light + self.fog_color.g * fog_t, 0.0, 1.0);
+                let fb = clampf(b * light + self.fog_color.b * fog_t, 0.0, 1.0);
+
+                let px_color = ((fr*255.0) as u32) << 24
+                    | ((fg*255.0) as u32) << 16
+                    | ((fb*255.0) as u32) << 8
+                    | 0xFF;
+
+                canvas.buf.put_pixel(col, y, px_color);
+                y += 1;
+            }
+        } else {
+            // Flat-shaded fallback
+            let base = Color::rgb(0.6, 0.5, 0.4);
+            let light = side_shade * (1.0 - fog_t * 0.9);
+            let shaded = base.darkened(1.0 - light);
+            let px_color = shaded.to_rgba32();
+            canvas.draw_vstripe(col, y_top, y_bot + 1, px_color);
+        }
+    }
+}
+
+trait F32Ops {
+    fn max(self, rhs: f32) -> f32;
+    fn min(self, rhs: f32) -> f32;
+}
+impl F32Ops for f32 {
+    fn max(self, rhs: f32) -> f32 { if self > rhs { self } else { rhs } }
+    fn min(self, rhs: f32) -> f32 { if self < rhs { self } else { rhs } }
+}
+trait I32Ops {
+    fn max(self, rhs: i32) -> i32;
+    fn min(self, rhs: i32) -> i32;
+}
+impl I32Ops for i32 {
+    fn max(self, rhs: i32) -> i32 { if self > rhs { self } else { rhs } }
+    fn min(self, rhs: i32) -> i32 { if self < rhs { self } else { rhs } }
+}

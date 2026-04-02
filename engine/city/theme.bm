@@ -1,0 +1,200 @@
+/// BlackMagic Engine — city/theme.bm
+///
+/// Oracle City — 5 visual themes.
+///
+/// Themes:
+///   0  Midnight  — dark greys + midnight purples  (default)
+///   1  Neon      — electric cyan + acid green on black
+///   2  Blood     — deep crimson + rose on near-black
+///   3  Amber     — terminal amber on dark brown-black
+///   4  Ghost     — pale steel-blue on deep charcoal
+///
+/// Press T in-game to cycle through themes.
+
+use engine::core::math::{ Color };
+
+// ─── Theme ────────────────────────────────────────────────────────────────────
+
+pub struct Theme {
+    pub name:         str,
+
+    // Backgrounds
+    pub bg:           Color,   // clear / sky colour
+    pub panel_bg:     Color,   // modal / info panel background
+    pub hud_bar:      Color,   // stats bar, minimap bg strip
+
+    // Borders + structure
+    pub border:       Color,   // panel outlines, minimap frame
+    pub divider:      Color,   // thin separator lines
+
+    // Foreground
+    pub text:         Color,   // primary readable text
+    pub dim:          Color,   // secondary / hints
+    pub accent:       Color,   // primary accent (titles, highlights)
+    pub accent2:      Color,   // secondary accent (direction arrow, values)
+
+    // Semantic colours
+    pub col_green:    Color,   // money, active/ok
+    pub col_yellow:   Color,   // corp, warnings
+    pub col_red:      Color,   // gang, danger, north compass
+    pub col_magenta:  Color,   // aug, special
+
+    // Map colours
+    pub player_dot:   Color,
+    pub player_dir:   Color,
+    pub map_floor:    Color,
+    pub map_fov:      Color,
+}
+
+// ─── 5 Themes ─────────────────────────────────────────────────────────────────
+
+/// 0 — Midnight: deep charcoal + midnight purple.
+pub const THEME_MIDNIGHT: Theme = Theme {
+    name: "Midnight",
+
+    bg:        Color { r:0.05, g:0.05, b:0.08, a:1.0 },
+    panel_bg:  Color { r:0.08, g:0.07, b:0.12, a:0.94 },
+    hud_bar:   Color { r:0.05, g:0.04, b:0.09, a:0.88 },
+
+    border:    Color { r:0.48, g:0.32, b:0.83, a:0.55 },
+    divider:   Color { r:0.28, g:0.22, b:0.42, a:0.6  },
+
+    text:      Color { r:0.78, g:0.75, b:0.91, a:1.0 },
+    dim:       Color { r:0.40, g:0.37, b:0.55, a:1.0 },
+    accent:    Color { r:0.60, g:0.38, b:0.95, a:1.0 },
+    accent2:   Color { r:0.78, g:0.62, b:1.00, a:1.0 },
+
+    col_green:   Color { r:0.43, g:0.91, b:0.61, a:1.0 },
+    col_yellow:  Color { r:0.91, g:0.79, b:0.43, a:1.0 },
+    col_red:     Color { r:0.91, g:0.31, b:0.43, a:1.0 },
+    col_magenta: Color { r:0.85, g:0.43, b:1.00, a:1.0 },
+
+    player_dot:  Color { r:0.72, g:0.48, b:1.00, a:1.0 },
+    player_dir:  Color { r:0.88, g:0.70, b:1.00, a:0.9 },
+    map_floor:   Color { r:0.09, g:0.08, b:0.13, a:1.0 },
+    map_fov:     Color { r:0.60, g:0.38, b:0.95, a:0.25 },
+};
+
+/// 1 — Neon: electric cyan + acid green cyberpunk.
+pub const THEME_NEON: Theme = Theme {
+    name: "Neon",
+
+    bg:        Color { r:0.02, g:0.04, b:0.05, a:1.0 },
+    panel_bg:  Color { r:0.03, g:0.07, b:0.10, a:0.94 },
+    hud_bar:   Color { r:0.02, g:0.05, b:0.07, a:0.88 },
+
+    border:    Color { r:0.00, g:0.83, b:1.00, a:0.50 },
+    divider:   Color { r:0.00, g:0.42, b:0.52, a:0.6  },
+
+    text:      Color { r:0.75, g:0.94, b:0.97, a:1.0 },
+    dim:       Color { r:0.23, g:0.42, b:0.48, a:1.0 },
+    accent:    Color { r:0.00, g:0.83, b:1.00, a:1.0 },
+    accent2:   Color { r:0.00, g:1.00, b:0.62, a:1.0 },
+
+    col_green:   Color { r:0.00, g:1.00, b:0.62, a:1.0 },
+    col_yellow:  Color { r:1.00, g:0.93, b:0.25, a:1.0 },
+    col_red:     Color { r:1.00, g:0.18, b:0.33, a:1.0 },
+    col_magenta: Color { r:1.00, g:0.00, b:0.75, a:1.0 },
+
+    player_dot:  Color { r:0.00, g:1.00, b:0.62, a:1.0 },
+    player_dir:  Color { r:0.00, g:0.83, b:1.00, a:0.9 },
+    map_floor:   Color { r:0.04, g:0.07, b:0.08, a:1.0 },
+    map_fov:     Color { r:0.00, g:0.83, b:1.00, a:0.2 },
+};
+
+/// 2 — Blood: deep crimson and rose.
+pub const THEME_BLOOD: Theme = Theme {
+    name: "Blood",
+
+    bg:        Color { r:0.05, g:0.02, b:0.02, a:1.0 },
+    panel_bg:  Color { r:0.09, g:0.04, b:0.05, a:0.94 },
+    hud_bar:   Color { r:0.07, g:0.02, b:0.03, a:0.88 },
+
+    border:    Color { r:0.80, g:0.10, b:0.18, a:0.55 },
+    divider:   Color { r:0.40, g:0.10, b:0.14, a:0.6  },
+
+    text:      Color { r:0.94, g:0.82, b:0.84, a:1.0 },
+    dim:       Color { r:0.50, g:0.27, b:0.30, a:1.0 },
+    accent:    Color { r:1.00, g:0.20, b:0.33, a:1.0 },
+    accent2:   Color { r:1.00, g:0.55, b:0.65, a:1.0 },
+
+    col_green:   Color { r:0.56, g:0.91, b:0.43, a:1.0 },
+    col_yellow:  Color { r:0.91, g:0.70, b:0.25, a:1.0 },
+    col_red:     Color { r:1.00, g:0.20, b:0.33, a:1.0 },
+    col_magenta: Color { r:1.00, g:0.43, b:0.80, a:1.0 },
+
+    player_dot:  Color { r:1.00, g:0.20, b:0.33, a:1.0 },
+    player_dir:  Color { r:1.00, g:0.55, b:0.65, a:0.9 },
+    map_floor:   Color { r:0.07, g:0.04, b:0.04, a:1.0 },
+    map_fov:     Color { r:1.00, g:0.20, b:0.33, a:0.2 },
+};
+
+/// 3 — Amber: warm terminal orange on charcoal.
+pub const THEME_AMBER: Theme = Theme {
+    name: "Amber",
+
+    bg:        Color { r:0.05, g:0.04, b:0.00, a:1.0 },
+    panel_bg:  Color { r:0.09, g:0.07, b:0.01, a:0.94 },
+    hud_bar:   Color { r:0.07, g:0.05, b:0.00, a:0.88 },
+
+    border:    Color { r:0.91, g:0.63, b:0.13, a:0.55 },
+    divider:   Color { r:0.45, g:0.30, b:0.06, a:0.6  },
+
+    text:      Color { r:0.94, g:0.88, b:0.70, a:1.0 },
+    dim:       Color { r:0.50, g:0.42, b:0.22, a:1.0 },
+    accent:    Color { r:0.91, g:0.63, b:0.13, a:1.0 },
+    accent2:   Color { r:1.00, g:0.80, b:0.27, a:1.0 },
+
+    col_green:   Color { r:0.63, g:0.78, b:0.25, a:1.0 },
+    col_yellow:  Color { r:1.00, g:0.80, b:0.27, a:1.0 },
+    col_red:     Color { r:0.91, g:0.25, b:0.19, a:1.0 },
+    col_magenta: Color { r:0.91, g:0.40, b:0.78, a:1.0 },
+
+    player_dot:  Color { r:1.00, g:0.80, b:0.27, a:1.0 },
+    player_dir:  Color { r:0.91, g:0.63, b:0.13, a:0.9 },
+    map_floor:   Color { r:0.07, g:0.06, b:0.02, a:1.0 },
+    map_fov:     Color { r:0.91, g:0.63, b:0.13, a:0.2 },
+};
+
+/// 4 — Ghost: pale steel-blue on deep charcoal.
+pub const THEME_GHOST: Theme = Theme {
+    name: "Ghost",
+
+    bg:        Color { r:0.04, g:0.05, b:0.06, a:1.0 },
+    panel_bg:  Color { r:0.07, g:0.09, b:0.12, a:0.94 },
+    hud_bar:   Color { r:0.05, g:0.06, b:0.09, a:0.88 },
+
+    border:    Color { r:0.63, g:0.72, b:0.85, a:0.45 },
+    divider:   Color { r:0.28, g:0.34, b:0.42, a:0.6  },
+
+    text:      Color { r:0.88, g:0.91, b:0.97, a:1.0 },
+    dim:       Color { r:0.38, g:0.44, b:0.55, a:1.0 },
+    accent:    Color { r:0.63, g:0.72, b:0.85, a:1.0 },
+    accent2:   Color { r:0.79, g:0.85, b:0.95, a:1.0 },
+
+    col_green:   Color { r:0.56, g:0.88, b:0.72, a:1.0 },
+    col_yellow:  Color { r:0.91, g:0.82, b:0.56, a:1.0 },
+    col_red:     Color { r:0.88, g:0.56, b:0.56, a:1.0 },
+    col_magenta: Color { r:0.83, g:0.63, b:0.93, a:1.0 },
+
+    player_dot:  Color { r:0.79, g:0.85, b:0.95, a:1.0 },
+    player_dir:  Color { r:0.63, g:0.72, b:0.85, a:0.9 },
+    map_floor:   Color { r:0.06, g:0.07, b:0.10, a:1.0 },
+    map_fov:     Color { r:0.63, g:0.72, b:0.85, a:0.2 },
+};
+
+// ─── Theme table + cycle helper ───────────────────────────────────────────────
+
+pub const N_THEMES: u32 = 5;
+
+/// Get a theme by index (0–4). Wraps around.
+pub fn theme_get(idx: u32) -> &Theme {
+    let i = idx % N_THEMES;
+    match i {
+        0 => &THEME_MIDNIGHT,
+        1 => &THEME_NEON,
+        2 => &THEME_BLOOD,
+        3 => &THEME_AMBER,
+        _ => &THEME_GHOST,
+    }
+}

@@ -1,0 +1,364 @@
+/// BlackMagic Engine — renderer/canvas.bm
+///
+/// Software canvas renderer — pure BlackMagic, zero FFI.
+/// Manages a pixel framebuffer and exposes Godot-style draw_* commands.
+///
+/// CanvasBuffer  — owned pixel array (RGBA8, row-major)
+/// Canvas2D      — draw commands: line, rect, circle, triangle, text blit
+/// RenderTarget  — abstraction over CanvasBuffer + z-sorted draw list
+///
+/// The platform layer reads the final CanvasBuffer and blits it to screen
+/// using a platform-specific blit (web: putImageData, native: SDL blit) —
+/// but ALL pixel work happens here in pure BM.
+
+use engine::core::math::{ Vec2, Rect2, Color, clampf, floorf, fabsf, sqrt, sin, cos };
+use bm::collections::Vec as BmVec;
+use bm::mem::{ alloc_slice, free_slice };
+
+// ─── CanvasBuffer ──────────────────────────────────────────────────────────
+
+pub struct CanvasBuffer {
+    pub width:  u32,
+    pub height: u32,
+    pub pixels: *var u32,   // RGBA8 packed: 0xRRGGBBAA
+}
+
+impl CanvasBuffer {
+    pub fn new(width: u32, height: u32) -> CanvasBuffer {
+        let count = (width * height) as usize;
+        let pixels = alloc_slice::<u32>(count);
+        // Zero-fill (transparent black)
+        var i: usize = 0;
+        while i < count { unsafe { *pixels.add(i) = 0x000000FF; } i += 1; }
+        CanvasBuffer { width, height, pixels }
+    }
+
+    pub fn free(self: &var CanvasBuffer) {
+        free_slice(self.pixels, (self.width * self.height) as usize);
+    }
+
+    #[inline]
+    pub fn put_pixel(self: &var CanvasBuffer, x: u32, y: u32, color: u32) {
+        if x < self.width && y < self.height {
+            unsafe { *self.pixels.add((y * self.width + x) as usize) = color; }
+        }
+    }
+
+    #[inline]
+    pub fn get_pixel(self: &CanvasBuffer, x: u32, y: u32) -> u32 {
+        if x < self.width && y < self.height {
+            unsafe { *self.pixels.add((y * self.width + x) as usize) }
+        } else { 0 }
+    }
+
+    pub fn clear(self: &var CanvasBuffer, color: u32) {
+        let count = (self.width * self.height) as usize;
+        var i: usize = 0;
+        while i < count { unsafe { *self.pixels.add(i) = color; } i += 1; }
+    }
+
+    pub fn blit_rect(self: &var CanvasBuffer, src: &CanvasBuffer,
+                     src_rect: Rect2, dst_pos: Vec2) {
+        let sx0 = src_rect.pos.x as i32;
+        let sy0 = src_rect.pos.y as i32;
+        let sw  = src_rect.size.x as i32;
+        let sh  = src_rect.size.y as i32;
+        var row: i32 = 0;
+        while row < sh {
+            var col: i32 = 0;
+            while col < sw {
+                let sx = (sx0 + col) as u32;
+                let sy = (sy0 + row) as u32;
+                let dx = (dst_pos.x as i32 + col) as u32;
+                let dy = (dst_pos.y as i32 + row) as u32;
+                let px = src.get_pixel(sx, sy);
+                self.alpha_blend_pixel(dx, dy, px);
+                col += 1;
+            }
+            row += 1;
+        }
+    }
+
+    /// Alpha-blend `src` RGBA8 over the destination pixel.
+    #[inline]
+    pub fn alpha_blend_pixel(self: &var CanvasBuffer, x: u32, y: u32, src: u32) {
+        let sa = (src & 0xFF) as f32 / 255.0;
+        if sa == 0.0 { return; }
+        if sa == 1.0 { self.put_pixel(x, y, src); return; }
+        let dst = self.get_pixel(x, y);
+        let dr = ((dst >> 24) & 0xFF) as f32 / 255.0;
+        let dg = ((dst >> 16) & 0xFF) as f32 / 255.0;
+        let db = ((dst >>  8) & 0xFF) as f32 / 255.0;
+        let sr = ((src >> 24) & 0xFF) as f32 / 255.0;
+        let sg = ((src >> 16) & 0xFF) as f32 / 255.0;
+        let sb = ((src >>  8) & 0xFF) as f32 / 255.0;
+        let ia = 1.0 - sa;
+        let r = ((sr*sa + dr*ia)*255.0) as u32;
+        let g = ((sg*sa + dg*ia)*255.0) as u32;
+        let b = ((sb*sa + db*ia)*255.0) as u32;
+        self.put_pixel(x, y, (r<<24)|(g<<16)|(b<<8)|0xFF);
+    }
+}
+
+// ─── Canvas2D ──────────────────────────────────────────────────────────────
+
+pub struct Canvas2D {
+    pub buf: CanvasBuffer,
+}
+
+impl Canvas2D {
+    pub fn new(width: u32, height: u32) -> Canvas2D {
+        Canvas2D { buf: CanvasBuffer::new(width, height) }
+    }
+
+    pub fn clear(self: &var Canvas2D, color: Color) {
+        self.buf.clear(color.to_rgba32());
+    }
+
+    // ── Primitives ────────────────────────────────────────────────────────
+
+    /// Bresenham line.
+    #[sicko]
+    pub fn draw_line(self: &var Canvas2D, a: Vec2, b: Vec2, color: Color) {
+        let c = color.to_rgba32();
+        var x0 = a.x as i32;
+        var y0 = a.y as i32;
+        let x1 = b.x as i32;
+        let y1 = b.y as i32;
+        let dx = if x1 > x0 { x1-x0 } else { x0-x1 };
+        let dy = if y1 > y0 { y1-y0 } else { y0-y1 };
+        let sx = if x0 < x1 { 1i32 } else { -1i32 };
+        let sy = if y0 < y1 { 1i32 } else { -1i32 };
+        var err = dx - dy;
+        loop {
+            self.buf.put_pixel(x0 as u32, y0 as u32, c);
+            if x0 == x1 && y0 == y1 { break; }
+            let e2 = err * 2;
+            if e2 > -dy { err -= dy; x0 += sx; }
+            if e2 <  dx { err += dx; y0 += sy; }
+        }
+    }
+
+    /// Thick line via multiple parallel Bresenham passes.
+    pub fn draw_line_width(self: &var Canvas2D, a: Vec2, b: Vec2, color: Color, width: f32) {
+        if width <= 1.0 { self.draw_line(a, b, color); return; }
+        let half = width * 0.5;
+        let dir  = b.sub(a).normalized();
+        let perp = Vec2{x:-dir.y, y:dir.x};
+        var t = -half;
+        while t <= half {
+            let offset = perp.scale(t);
+            self.draw_line(a.add(offset), b.add(offset), color);
+            t += 1.0;
+        }
+    }
+
+    /// Axis-aligned filled rectangle.
+    pub fn draw_rect(self: &var Canvas2D, rect: Rect2, color: Color) {
+        let c   = color.to_rgba32();
+        let x0  = clamp_coord(rect.pos.x as i32, self.buf.width);
+        let y0  = clamp_coord(rect.pos.y as i32, self.buf.height);
+        let x1  = clamp_coord((rect.pos.x + rect.size.x) as i32, self.buf.width);
+        let y1  = clamp_coord((rect.pos.y + rect.size.y) as i32, self.buf.height);
+        var y = y0;
+        while y < y1 {
+            var x = x0;
+            while x < x1 { self.buf.put_pixel(x as u32, y as u32, c); x += 1; }
+            y += 1;
+        }
+    }
+
+    /// Rectangle outline.
+    pub fn draw_rect_outline(self: &var Canvas2D, rect: Rect2, color: Color) {
+        let r = rect;
+        let tl = r.pos;
+        let tr = Vec2{x:r.pos.x+r.size.x, y:r.pos.y};
+        let bl = Vec2{x:r.pos.x,           y:r.pos.y+r.size.y};
+        let br = r.end();
+        self.draw_line(tl, tr, color);
+        self.draw_line(tr, br, color);
+        self.draw_line(br, bl, color);
+        self.draw_line(bl, tl, color);
+    }
+
+    /// Midpoint circle — filled.
+    pub fn draw_circle(self: &var Canvas2D, center: Vec2, radius: f32, color: Color) {
+        let c  = color.to_rgba32();
+        let r  = radius as i32;
+        let cx = center.x as i32;
+        let cy = center.y as i32;
+        var y = -r;
+        while y <= r {
+            let half_w = sqrt(((r*r - y*y) as f32).max(0.0)) as i32;
+            var x = cx - half_w;
+            while x <= cx + half_w {
+                self.buf.put_pixel(x as u32, (cy + y) as u32, c);
+                x += 1;
+            }
+            y += 1;
+        }
+    }
+
+    /// Circle outline (Bresenham).
+    pub fn draw_circle_outline(self: &var Canvas2D, center: Vec2, radius: f32, color: Color) {
+        let c  = color.to_rgba32();
+        let r  = radius as i32;
+        let cx = center.x as i32;
+        let cy = center.y as i32;
+        var x = 0i32;
+        var y = r;
+        var d = 3 - 2 * r;
+        while y >= x {
+            plot_circle_octants(&var self.buf, cx, cy, x, y, c);
+            x += 1;
+            if d > 0 { y -= 1; d += 4*(x-y)+10; } else { d += 4*x+6; }
+        }
+    }
+
+    /// Filled triangle (software rasteriser — scanline).
+    #[sicko]
+    pub fn draw_triangle(self: &var Canvas2D, a: Vec2, b: Vec2, c_pt: Vec2, color: Color) {
+        let col = color.to_rgba32();
+        // Sort vertices by y
+        let (p0, p1, p2) = sort_by_y(a, b, c_pt);
+        if p0.y == p2.y { return; }  // degenerate
+        let total_h = p2.y - p0.y;
+        var y = p0.y as i32;
+        while y <= p2.y as i32 {
+            let second_half = y >= p1.y as i32;
+            let seg_h = if second_half { p2.y - p1.y } else { p1.y - p0.y };
+            if seg_h < 0.001 { y += 1; continue; }
+            let alpha = (y as f32 - p0.y) / total_h;
+            let beta  = if second_half {
+                (y as f32 - p1.y) / seg_h
+            } else {
+                (y as f32 - p0.y) / seg_h
+            };
+            var xa = p0.x + (p2.x - p0.x) * alpha;
+            var xb = if second_half {
+                p1.x + (p2.x - p1.x) * beta
+            } else {
+                p0.x + (p1.x - p0.x) * beta
+            };
+            if xa > xb { let t = xa; xa = xb; xb = t; }
+            var x = xa as i32;
+            while x <= xb as i32 {
+                self.buf.put_pixel(x as u32, y as u32, col);
+                x += 1;
+            }
+            y += 1;
+        }
+    }
+
+    /// Vertical stripe — used by raycaster for wall columns.
+    #[inline]
+    pub fn draw_vstripe(self: &var Canvas2D, x: u32, y_top: u32, y_bot: u32, color: u32) {
+        var y = y_top;
+        while y < y_bot && y < self.buf.height {
+            self.buf.put_pixel(x, y, color);
+            y += 1;
+        }
+    }
+
+    /// Horizontal gradient stripe (for floor/ceiling shading).
+    pub fn draw_hstripe_gradient(self: &var Canvas2D, y: u32,
+                                  x0: u32, x1: u32,
+                                  c0: Color, c1: Color) {
+        if x0 >= x1 { return; }
+        let w = (x1 - x0) as f32;
+        var x = x0;
+        while x < x1 {
+            let t = (x - x0) as f32 / w;
+            let c = c0.lerp(c1, t);
+            self.buf.put_pixel(x, y, c.to_rgba32());
+            x += 1;
+        }
+    }
+
+    /// Monospace bitmap font blit.
+    /// `glyphs` is a 128-char monospace atlas: each char is `gw×gh` pixels packed in a CanvasBuffer.
+    pub fn draw_char(self: &var Canvas2D, ch: u8, pos: Vec2,
+                     color: Color, font: &BitmapFont) {
+        let idx = (ch as usize).min(127);
+        let src_x = (idx % font.cols) as f32 * font.glyph_w as f32;
+        let src_y = (idx / font.cols) as f32 * font.glyph_h as f32;
+        let src_rect = Rect2::new(src_x, src_y, font.glyph_w as f32, font.glyph_h as f32);
+        // Tinted blit: multiply atlas alpha by color
+        var gy: u32 = 0;
+        while gy < font.glyph_h {
+            var gx: u32 = 0;
+            while gx < font.glyph_w {
+                let ax = src_x as u32 + gx;
+                let ay = src_y as u32 + gy;
+                let atlas_px = font.atlas.get_pixel(ax, ay);
+                let alpha = (atlas_px & 0xFF) as f32 / 255.0;
+                if alpha > 0.0 {
+                    let tinted = color.with_alpha(alpha);
+                    self.buf.alpha_blend_pixel(
+                        pos.x as u32 + gx,
+                        pos.y as u32 + gy,
+                        tinted.to_rgba32(),
+                    );
+                }
+                gx += 1;
+            }
+            gy += 1;
+        }
+    }
+
+    pub fn draw_text(self: &var Canvas2D, text: str, pos: Vec2,
+                     color: Color, font: &BitmapFont) {
+        var i: usize = 0;
+        var cx = pos.x;
+        while i < text.len() {
+            let ch = text.byte_at(i);
+            if ch == 10u8 {
+                cx = pos.x;
+                // advance handled by caller — single-line for now
+            } else {
+                self.draw_char(ch, Vec2::new(cx, pos.y), color, font);
+                cx += font.glyph_w as f32;
+            }
+            i += 1;
+        }
+    }
+}
+
+// ─── BitmapFont ────────────────────────────────────────────────────────────
+
+pub struct BitmapFont {
+    pub atlas:   CanvasBuffer,  // full glyph atlas
+    pub glyph_w: u32,
+    pub glyph_h: u32,
+    pub cols:    u32,           // glyphs per atlas row
+}
+
+// ─── Helpers ───────────────────────────────────────────────────────────────
+
+fn clamp_coord(v: i32, max: u32) -> i32 {
+    if v < 0 { 0 } else if v > max as i32 { max as i32 } else { v }
+}
+
+fn plot_circle_octants(buf: &var CanvasBuffer, cx: i32, cy: i32, x: i32, y: i32, c: u32) {
+    buf.put_pixel((cx+x) as u32, (cy+y) as u32, c);
+    buf.put_pixel((cx-x) as u32, (cy+y) as u32, c);
+    buf.put_pixel((cx+x) as u32, (cy-y) as u32, c);
+    buf.put_pixel((cx-x) as u32, (cy-y) as u32, c);
+    buf.put_pixel((cx+y) as u32, (cy+x) as u32, c);
+    buf.put_pixel((cx-y) as u32, (cy+x) as u32, c);
+    buf.put_pixel((cx+y) as u32, (cy-x) as u32, c);
+    buf.put_pixel((cx-y) as u32, (cy-x) as u32, c);
+}
+
+fn sort_by_y(a: Vec2, b: Vec2, c: Vec2) -> (Vec2, Vec2, Vec2) {
+    var p0 = a; var p1 = b; var p2 = c;
+    if p0.y > p1.y { let t = p0; p0 = p1; p1 = t; }
+    if p0.y > p2.y { let t = p0; p0 = p2; p2 = t; }
+    if p1.y > p2.y { let t = p1; p1 = p2; p2 = t; }
+    (p0, p1, p2)
+}
+
+trait F32Max { fn max(self, rhs: f32) -> f32; }
+impl F32Max for f32 {
+    fn max(self, rhs: f32) -> f32 { if self > rhs { self } else { rhs } }
+}

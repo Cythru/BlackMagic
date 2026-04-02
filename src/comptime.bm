@@ -1,0 +1,339 @@
+/// BlackMagic Compile-Time Evaluator
+///
+/// Supports:
+///   - `comptime fn` — functions that execute at compile time
+///   - `comptime { expr }` — inline expressions evaluated at compile time
+///   - Constant folding of arithmetic, string ops, array construction
+
+use std::collections::HashMap;
+use crate::ast::*;
+use crate::error::{BmError, Span};
+use crate::types::TypeCtx;
+
+// ─── Comptime value ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CValue {
+    Int(i128),
+    UInt(u128),
+    Float(f64),
+    Bool(bool),
+    Str(String),
+    Char(char),
+    Array(Vec<CValue>),
+    Tuple(Vec<CValue>),
+    Null,
+    Void,
+}
+
+impl CValue {
+    pub fn as_int(&self)  -> Option<i128> { if let CValue::Int(n) = self  { Some(*n) } else { None } }
+    pub fn as_bool(&self) -> Option<bool> { if let CValue::Bool(b) = self { Some(*b) } else { None } }
+    pub fn as_f64(&self)  -> Option<f64>  { if let CValue::Float(f) = self { Some(*f) } else { None } }
+}
+
+// ─── Comptime environment ──────────────────────────────────────────────────
+
+#[derive(Clone, Default)]
+pub struct CEnv {
+    scopes: Vec<HashMap<String, CValue>>,
+}
+
+impl CEnv {
+    pub fn new() -> Self { CEnv { scopes: vec![HashMap::new()] } }
+    pub fn push(&mut self) { self.scopes.push(HashMap::new()); }
+    pub fn pop(&mut self)  { self.scopes.pop(); }
+    pub fn define(&mut self, name: &str, val: CValue) {
+        self.scopes.last_mut().unwrap().insert(name.to_string(), val);
+    }
+    pub fn lookup(&self, name: &str) -> Option<&CValue> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(v) = scope.get(name) { return Some(v); }
+        }
+        None
+    }
+}
+
+// ─── Comptime evaluator ────────────────────────────────────────────────────
+
+pub struct ComptimeEval {
+    pub errors:     Vec<BmError>,
+    env:            CEnv,
+    comptime_fns:   HashMap<String, FunctionDecl>,
+    cache:          HashMap<String, CValue>,
+    depth:          usize,
+    pub type_ctx:   TypeCtx,
+}
+
+const MAX_DEPTH: usize = 256;
+
+impl ComptimeEval {
+    pub fn new(type_ctx: TypeCtx) -> Self {
+        ComptimeEval {
+            errors:       Vec::new(),
+            env:          CEnv::new(),
+            comptime_fns: HashMap::new(),
+            cache:        HashMap::new(),
+            depth:        0,
+            type_ctx,
+        }
+    }
+
+    pub fn collect_comptime_fns(&mut self, file: &SourceFile) {
+        for item in &file.items {
+            if let ItemKind::Function(f) = &item.kind {
+                if f.is_comptime {
+                    self.comptime_fns.insert(f.name.name.clone(), f.clone());
+                }
+            }
+        }
+    }
+
+    pub fn eval_expr(&mut self, expr: &Expr) -> Option<CValue> {
+        if self.depth > MAX_DEPTH {
+            self.errors.push(BmError::ComptimeError {
+                msg: "comptime recursion limit exceeded".to_string(),
+                span: expr.span,
+            });
+            return None;
+        }
+        self.depth += 1;
+        let result = self.eval_inner(expr);
+        self.depth -= 1;
+        result
+    }
+
+    fn eval_inner(&mut self, expr: &Expr) -> Option<CValue> {
+        match &expr.kind {
+            ExprKind::Lit(lit) => Some(self.eval_literal(lit)),
+
+            ExprKind::Var(path) => {
+                let name = path.segments.last()?.name.clone();
+                if let Some(v) = self.env.lookup(&name) {
+                    Some(v.clone())
+                } else {
+                    self.errors.push(BmError::ComptimeError {
+                        msg: format!("undefined comptime variable `{}`", name),
+                        span: expr.span,
+                    });
+                    None
+                }
+            }
+
+            ExprKind::Binary { op, lhs, rhs } => {
+                let l = self.eval_inner(lhs)?;
+                let r = self.eval_inner(rhs)?;
+                self.eval_binop(op, l, r, expr.span)
+            }
+
+            ExprKind::Unary { op, operand } => {
+                let v = self.eval_inner(operand)?;
+                self.eval_unary(op, v, expr.span)
+            }
+
+            ExprKind::If { cond, then, else_ } => {
+                let cv = self.eval_inner(cond)?;
+                match cv.as_bool() {
+                    Some(true)  => self.eval_block(then),
+                    Some(false) => {
+                        if let Some(el) = else_ { self.eval_inner(el) }
+                        else { Some(CValue::Void) }
+                    }
+                    None => {
+                        self.errors.push(BmError::ComptimeError {
+                            msg: "comptime `if` condition must be bool".to_string(),
+                            span: cond.span,
+                        });
+                        None
+                    }
+                }
+            }
+
+            ExprKind::Block(b) => self.eval_block(b),
+
+            ExprKind::Call { callee, args } => {
+                if let ExprKind::Var(path) = &callee.kind {
+                    let name = path.segments.last()?.name.clone();
+                    let evaled: Option<Vec<CValue>> = args.iter()
+                        .map(|a| self.eval_inner(&a.expr))
+                        .collect();
+                    self.call_comptime_fn(&name.clone(), evaled?, expr.span)
+                } else {
+                    self.errors.push(BmError::ComptimeError {
+                        msg: "comptime calls must be to named functions".to_string(),
+                        span: callee.span,
+                    });
+                    None
+                }
+            }
+
+            ExprKind::Array(ae) => {
+                match ae {
+                    ArrayExpr::List(elems) => {
+                        let vs: Option<Vec<CValue>> = elems.iter()
+                            .map(|e| self.eval_inner(e))
+                            .collect();
+                        Some(CValue::Array(vs?))
+                    }
+                    ArrayExpr::Repeat { elem, count } => {
+                        let v = self.eval_inner(elem)?;
+                        let n = self.eval_inner(count)?.as_int()? as usize;
+                        Some(CValue::Array(vec![v; n]))
+                    }
+                }
+            }
+
+            ExprKind::Tuple(elems) => {
+                let vs: Option<Vec<CValue>> = elems.iter()
+                    .map(|e| self.eval_inner(e))
+                    .collect();
+                Some(CValue::Tuple(vs?))
+            }
+
+            ExprKind::Index { base, idx } => {
+                let base_v = self.eval_inner(base)?;
+                let idx_v  = self.eval_inner(idx)?;
+                match (base_v, idx_v.as_int()) {
+                    (CValue::Array(arr), Some(i)) if i >= 0 && (i as usize) < arr.len() => {
+                        Some(arr[i as usize].clone())
+                    }
+                    _ => {
+                        self.errors.push(BmError::ComptimeError {
+                            msg: "comptime index out of bounds".to_string(),
+                            span: expr.span,
+                        });
+                        None
+                    }
+                }
+            }
+
+            ExprKind::Comptime(inner) => self.eval_inner(inner),
+
+            _ => {
+                self.errors.push(BmError::ComptimeError {
+                    msg: "expression not supported at comptime".to_string(),
+                    span: expr.span,
+                });
+                None
+            }
+        }
+    }
+
+    fn eval_block(&mut self, block: &Block) -> Option<CValue> {
+        self.env.push();
+        let mut result = None;
+        'stmts: for stmt in &block.stmts {
+            match &stmt.kind {
+                StmtKind::Let { pattern, init, .. } => {
+                    let v = init.as_ref().and_then(|e| self.eval_inner(e))?;
+                    if let PatternKind::Ident { name, .. } = &pattern.kind {
+                        self.env.define(&name.name, v);
+                    }
+                }
+                StmtKind::Expr(e) => {
+                    if let ExprKind::Return(ret) = &e.kind {
+                        result = ret.as_ref().and_then(|r| self.eval_inner(r));
+                        self.env.pop();
+                        return result;
+                    }
+                    self.eval_inner(e);
+                }
+                _ => {}
+            }
+        }
+        result = block.expr.as_ref().and_then(|e| self.eval_inner(e))
+            .or(Some(CValue::Void));
+        self.env.pop();
+        result
+    }
+
+    fn call_comptime_fn(&mut self, name: &str, args: Vec<CValue>, span: Span) -> Option<CValue> {
+        let cache_key = format!("{}({:?})", name, args);
+        if let Some(v) = self.cache.get(&cache_key) { return Some(v.clone()); }
+
+        let f = self.comptime_fns.get(name).cloned()?;
+        if f.params.len() != args.len() {
+            self.errors.push(BmError::ComptimeError {
+                msg: format!("comptime fn `{}` expects {} args, got {}", name, f.params.len(), args.len()),
+                span,
+            });
+            return None;
+        }
+
+        self.env.push();
+        for (p, v) in f.params.iter().zip(args) {
+            if let PatternKind::Ident { name: pname, .. } = &p.name.kind {
+                self.env.define(&pname.name, v);
+            }
+        }
+        let result = f.body.as_ref().and_then(|b| self.eval_block(b));
+        self.env.pop();
+
+        if let Some(ref v) = result {
+            self.cache.insert(cache_key, v.clone());
+        }
+        result
+    }
+
+    fn eval_literal(&self, lit: &Literal) -> CValue {
+        match lit {
+            Literal::Int(n)   => CValue::Int(*n as i128),
+            Literal::Float(f) => CValue::Float(*f),
+            Literal::Bool(b)  => CValue::Bool(*b),
+            Literal::Str(s)   => CValue::Str(s.clone()),
+            Literal::Char(c)  => CValue::Char(*c),
+            Literal::Byte(b)  => CValue::Int(*b as i128),
+            Literal::Null     => CValue::Null,
+        }
+    }
+
+    fn eval_binop(&mut self, op: &BinaryOp, l: CValue, r: CValue, span: Span) -> Option<CValue> {
+        match (op, &l, &r) {
+            (BinaryOp::Add, CValue::Int(a), CValue::Int(b))   => Some(CValue::Int(a.wrapping_add(*b))),
+            (BinaryOp::Sub, CValue::Int(a), CValue::Int(b))   => Some(CValue::Int(a.wrapping_sub(*b))),
+            (BinaryOp::Mul, CValue::Int(a), CValue::Int(b))   => Some(CValue::Int(a.wrapping_mul(*b))),
+            (BinaryOp::Div, CValue::Int(a), CValue::Int(b))   => {
+                if *b == 0 {
+                    self.errors.push(BmError::ComptimeError { msg: "division by zero".to_string(), span });
+                    None
+                } else { Some(CValue::Int(a / b)) }
+            }
+            (BinaryOp::Rem, CValue::Int(a), CValue::Int(b))   => Some(CValue::Int(a % b)),
+            (BinaryOp::Add, CValue::Float(a), CValue::Float(b)) => Some(CValue::Float(a + b)),
+            (BinaryOp::Sub, CValue::Float(a), CValue::Float(b)) => Some(CValue::Float(a - b)),
+            (BinaryOp::Mul, CValue::Float(a), CValue::Float(b)) => Some(CValue::Float(a * b)),
+            (BinaryOp::Div, CValue::Float(a), CValue::Float(b)) => Some(CValue::Float(a / b)),
+            (BinaryOp::Eq,  a, b) => Some(CValue::Bool(a == b)),
+            (BinaryOp::Ne,  a, b) => Some(CValue::Bool(a != b)),
+            (BinaryOp::Lt,  CValue::Int(a), CValue::Int(b))   => Some(CValue::Bool(a < b)),
+            (BinaryOp::Le,  CValue::Int(a), CValue::Int(b))   => Some(CValue::Bool(a <= b)),
+            (BinaryOp::Gt,  CValue::Int(a), CValue::Int(b))   => Some(CValue::Bool(a > b)),
+            (BinaryOp::Ge,  CValue::Int(a), CValue::Int(b))   => Some(CValue::Bool(a >= b)),
+            (BinaryOp::And, CValue::Bool(a), CValue::Bool(b)) => Some(CValue::Bool(*a && *b)),
+            (BinaryOp::Or,  CValue::Bool(a), CValue::Bool(b)) => Some(CValue::Bool(*a || *b)),
+            (BinaryOp::Add, CValue::Str(a), CValue::Str(b))   => Some(CValue::Str(a.clone() + b)),
+            _ => {
+                self.errors.push(BmError::ComptimeError {
+                    msg: format!("comptime op {:?} not supported for {:?}", op, l),
+                    span,
+                });
+                None
+            }
+        }
+    }
+
+    fn eval_unary(&mut self, op: &UnaryOp, v: CValue, span: Span) -> Option<CValue> {
+        match (op, v) {
+            (UnaryOp::Neg, CValue::Int(n))   => Some(CValue::Int(-n)),
+            (UnaryOp::Neg, CValue::Float(f)) => Some(CValue::Float(-f)),
+            (UnaryOp::Not, CValue::Bool(b))  => Some(CValue::Bool(!b)),
+            _ => {
+                self.errors.push(BmError::ComptimeError {
+                    msg: "comptime unary op not supported".to_string(),
+                    span,
+                });
+                None
+            }
+        }
+    }
+}

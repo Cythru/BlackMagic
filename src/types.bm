@@ -1,0 +1,495 @@
+/// BlackMagic Type System
+/// Type representation after elaboration (distinct from the AST Type).
+
+use std::collections::HashMap;
+use crate::error::Span;
+
+// ─── Type IDs ────────────────────────────────────────────────────────────────
+
+/// Opaque handle to a type in the type context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TypeId(pub u32);
+
+impl TypeId {
+    pub const NEVER:  TypeId = TypeId(0);
+    pub const VOID:   TypeId = TypeId(1);
+    pub const BOOL:   TypeId = TypeId(2);
+    pub const I8:     TypeId = TypeId(3);
+    pub const I16:    TypeId = TypeId(4);
+    pub const I32:    TypeId = TypeId(5);
+    pub const I64:    TypeId = TypeId(6);
+    pub const I128:   TypeId = TypeId(7);
+    pub const ISIZE:  TypeId = TypeId(8);
+    pub const U8:     TypeId = TypeId(9);
+    pub const U16:    TypeId = TypeId(10);
+    pub const U32:    TypeId = TypeId(11);
+    pub const U64:    TypeId = TypeId(12);
+    pub const U128:   TypeId = TypeId(13);
+    pub const USIZE:  TypeId = TypeId(14);
+    pub const F16:    TypeId = TypeId(15);
+    pub const F32:    TypeId = TypeId(16);
+    pub const F64:    TypeId = TypeId(17);
+    pub const F128:   TypeId = TypeId(18);
+    pub const CHAR:   TypeId = TypeId(19);
+    pub const STR:    TypeId = TypeId(20);
+    pub const BYTE:   TypeId = TypeId(21);
+    pub const INFER:  TypeId = TypeId(22);  // type variable
+
+    pub const BUILTIN_COUNT: u32 = 23;
+}
+
+// ─── Elaborated types ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Ty {
+    // Primitives (covered by TypeId constants above)
+    Primitive(PrimitiveTy),
+
+    // Composite
+    Struct(StructId),
+    Enum(EnumId),
+    Tuple(Vec<TypeId>),
+
+    // Generic instantiation: Vec<i32> → GenericInst { base: VecId, args: [i32] }
+    GenericInst { base: TypeId, args: Vec<TypeId> },
+
+    // References
+    Ref     { inner: TypeId, mutable: bool, region: Option<RegionId> },
+    Owned   (TypeId),
+    RawPtr  { inner: TypeId, mutable: bool },
+    WeakRef (TypeId),
+    Linear  (TypeId),
+
+    // Slice / Array
+    Slice(TypeId),
+    Array { elem: TypeId, len: u64 },
+
+    // Function
+    Fn {
+        params:  Vec<TypeId>,
+        ret:     TypeId,
+        effects: EffectSet,
+    },
+
+    // Optional
+    Optional(TypeId),
+
+    // SIMD
+    Simd { elem: TypeId, lanes: u32 },
+
+    // Tensor
+    Tensor { elem: TypeId, dims: Vec<Dim> },
+
+    // Effect type
+    WithEffects { inner: TypeId, effects: EffectSet },
+
+    // Refinement (type + predicate id)
+    Refined { inner: TypeId, pred: u32 },
+
+    // Type variable (for inference)
+    Var(TypeVarId),
+
+    // Never / Void
+    Never,
+    Void,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimitiveTy {
+    I8, I16, I32, I64, I128, Isize,
+    U8, U16, U32, U64, U128, Usize,
+    F16, F32, F64, F128,
+    Bool, Char, Str, Byte,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Dim {
+    Lit(u64),
+    Var(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StructId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EnumId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RegionId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TypeVarId(pub u32);
+
+// ─── Effect set ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EffectSet {
+    pub effects: Vec<EffectTy>,
+}
+
+impl EffectSet {
+    pub fn empty() -> Self { EffectSet { effects: vec![] } }
+    pub fn singleton(e: EffectTy) -> Self { EffectSet { effects: vec![e] } }
+
+    pub fn union(mut self, other: EffectSet) -> Self {
+        for e in other.effects {
+            if !self.effects.contains(&e) {
+                self.effects.push(e);
+            }
+        }
+        self
+    }
+
+    pub fn contains(&self, e: &EffectTy) -> bool { self.effects.contains(e) }
+    pub fn is_empty(&self) -> bool { self.effects.is_empty() }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffectTy {
+    pub name:     String,
+    pub generics: Vec<TypeId>,
+}
+
+// ─── Reference capabilities (Pony-inspired) ──────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefCap {
+    Iso,  // isolated: unique, sendable, mutable
+    Val,  // immutable value: globally shareable
+    Ref,  // mutable: thread-local aliasable
+    Box,  // read-only: aliasable across threads
+    Trn,  // transition: iso → val/ref
+    Tag,  // opaque: only identity
+}
+
+impl RefCap {
+    /// Can this capability be sent across actor boundaries?
+    pub fn is_sendable(self) -> bool {
+        matches!(self, RefCap::Iso | RefCap::Val | RefCap::Tag)
+    }
+
+    /// Can this capability be read through?
+    pub fn is_readable(self) -> bool {
+        !matches!(self, RefCap::Tag)
+    }
+
+    /// Can this capability be written through?
+    pub fn is_writable(self) -> bool {
+        matches!(self, RefCap::Iso | RefCap::Ref | RefCap::Trn)
+    }
+
+    /// Deny semantics: what this denies
+    pub fn denies_read_aliases(self) -> bool  { matches!(self, RefCap::Iso | RefCap::Trn) }
+    pub fn denies_write_aliases(self) -> bool { matches!(self, RefCap::Iso | RefCap::Val | RefCap::Box) }
+}
+
+// ─── Struct / enum type info ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct StructInfo {
+    pub id:       StructId,
+    pub name:     String,
+    pub fields:   Vec<FieldInfo>,
+    pub generics: Vec<String>,
+    pub is_linear: bool,
+    pub is_packed: bool,
+    pub is_soa:   bool,
+    pub align:    u32,
+    pub span:     Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct FieldInfo {
+    pub name:   String,
+    pub ty:     TypeId,
+    pub offset: u32,    // byte offset in the struct
+    pub vis:    FieldVis,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum FieldVis { Public, Module, Private }
+
+#[derive(Debug, Clone)]
+pub struct EnumInfo {
+    pub id:       EnumId,
+    pub name:     String,
+    pub variants: Vec<VariantInfo>,
+    pub generics: Vec<String>,
+    pub repr:     Option<TypeId>,
+    pub span:     Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct VariantInfo {
+    pub name:    String,
+    pub payload: VariantPayloadTy,
+    pub discrim: u128,
+}
+
+#[derive(Debug, Clone)]
+pub enum VariantPayloadTy {
+    Unit,
+    Tuple(Vec<TypeId>),
+    Struct(Vec<FieldInfo>),
+}
+
+// ─── Type context ─────────────────────────────────────────────────────────────
+
+/// Central repository for all types in a compilation.
+#[derive(Debug)]
+pub struct TypeCtx {
+    types:    Vec<Ty>,
+    structs:  Vec<StructInfo>,
+    enums:    Vec<EnumInfo>,
+    type_vars: Vec<Option<TypeId>>,  // inference substitution
+
+    // Built-in named types cache
+    builtins: HashMap<&'static str, TypeId>,
+}
+
+impl TypeCtx {
+    pub fn new() -> Self {
+        let mut ctx = TypeCtx {
+            types: Vec::new(),
+            structs: Vec::new(),
+            enums: Vec::new(),
+            type_vars: Vec::new(),
+            builtins: HashMap::new(),
+        };
+        // Pre-populate primitives
+        use PrimitiveTy::*;
+        let prims = [
+            (TypeId::NEVER,  Ty::Never),
+            (TypeId::VOID,   Ty::Void),
+            (TypeId::BOOL,   Ty::Primitive(Bool)),
+            (TypeId::I8,     Ty::Primitive(I8)),
+            (TypeId::I16,    Ty::Primitive(I16)),
+            (TypeId::I32,    Ty::Primitive(I32)),
+            (TypeId::I64,    Ty::Primitive(I64)),
+            (TypeId::I128,   Ty::Primitive(I128)),
+            (TypeId::ISIZE,  Ty::Primitive(Isize)),
+            (TypeId::U8,     Ty::Primitive(U8)),
+            (TypeId::U16,    Ty::Primitive(U16)),
+            (TypeId::U32,    Ty::Primitive(U32)),
+            (TypeId::U64,    Ty::Primitive(U64)),
+            (TypeId::U128,   Ty::Primitive(U128)),
+            (TypeId::USIZE,  Ty::Primitive(Usize)),
+            (TypeId::F16,    Ty::Primitive(F16)),
+            (TypeId::F32,    Ty::Primitive(F32)),
+            (TypeId::F64,    Ty::Primitive(F64)),
+            (TypeId::F128,   Ty::Primitive(F128)),
+            (TypeId::CHAR,   Ty::Primitive(Char)),
+            (TypeId::STR,    Ty::Primitive(Str)),
+            (TypeId::BYTE,   Ty::Primitive(Byte)),
+            (TypeId::INFER,  Ty::Var(TypeVarId(0))),
+        ];
+        ctx.types.resize(TypeId::BUILTIN_COUNT as usize, Ty::Void);
+        for (id, ty) in prims {
+            ctx.types[id.0 as usize] = ty;
+        }
+        ctx
+    }
+
+    pub fn intern(&mut self, ty: Ty) -> TypeId {
+        // Check if already interned (simple linear scan — use hash map in prod)
+        for (i, t) in self.types.iter().enumerate() {
+            if *t == ty { return TypeId(i as u32); }
+        }
+        let id = TypeId(self.types.len() as u32);
+        self.types.push(ty);
+        id
+    }
+
+    pub fn get(&self, id: TypeId) -> &Ty {
+        &self.types[id.0 as usize]
+    }
+
+    pub fn fresh_var(&mut self) -> TypeId {
+        let var_id = TypeVarId(self.type_vars.len() as u32);
+        self.type_vars.push(None);
+        self.intern(Ty::Var(var_id))
+    }
+
+    /// Follow type variable chain (Union-Find without path compression)
+    pub fn resolve(&self, id: TypeId) -> TypeId {
+        let mut cur = id;
+        loop {
+            match self.get(cur) {
+                Ty::Var(TypeVarId(v)) => {
+                    match self.type_vars.get(*v as usize).and_then(|x| *x) {
+                        Some(next) => cur = next,
+                        None       => return cur, // unbound variable
+                    }
+                }
+                _ => return cur,
+            }
+        }
+    }
+
+    pub fn unify(&mut self, a: TypeId, b: TypeId) -> Result<(), String> {
+        let a = self.resolve(a);
+        let b = self.resolve(b);
+        if a == b { return Ok(()); }
+
+        match (self.get(a).clone(), self.get(b).clone()) {
+            // Bind type variable
+            (Ty::Var(TypeVarId(v)), _) => { self.type_vars[v as usize] = Some(b); Ok(()) }
+            (_, Ty::Var(TypeVarId(v))) => { self.type_vars[v as usize] = Some(a); Ok(()) }
+
+            // Structural unification for compound types
+            (Ty::Tuple(va), Ty::Tuple(vb)) if va.len() == vb.len() => {
+                for (ta, tb) in va.into_iter().zip(vb) {
+                    self.unify(ta, tb)?;
+                }
+                Ok(())
+            }
+            (Ty::Slice(ia), Ty::Slice(ib)) => self.unify(ia, ib),
+            (Ty::Array { elem: ea, len: la }, Ty::Array { elem: eb, len: lb }) if la == lb => {
+                self.unify(ea, eb)
+            }
+            (Ty::Ref { inner: ia, mutable: ma, .. },
+             Ty::Ref { inner: ib, mutable: mb, .. }) if ma == mb => {
+                self.unify(ia, ib)
+            }
+            (Ty::Optional(ia), Ty::Optional(ib)) => self.unify(ia, ib),
+            (Ty::Owned(ia), Ty::Owned(ib)) => self.unify(ia, ib),
+            (Ty::Simd { elem: ea, lanes: la }, Ty::Simd { elem: eb, lanes: lb }) if la == lb => {
+                self.unify(ea, eb)
+            }
+
+            (ta, tb) => Err(format!("type mismatch: {:?} vs {:?}", ta, tb)),
+        }
+    }
+
+    pub fn register_struct(&mut self, info: StructInfo) -> StructId {
+        let id = StructId(self.structs.len() as u32);
+        self.structs.push(info);
+        id
+    }
+
+    pub fn get_struct(&self, id: StructId) -> &StructInfo {
+        &self.structs[id.0 as usize]
+    }
+
+    pub fn register_enum(&mut self, info: EnumInfo) -> EnumId {
+        let id = EnumId(self.enums.len() as u32);
+        self.enums.push(info);
+        id
+    }
+
+    pub fn get_enum(&self, id: EnumId) -> &EnumInfo {
+        &self.enums[id.0 as usize]
+    }
+
+    // ── Size / alignment queries ─────────────────────────────────────────────
+
+    pub fn size_of(&self, id: TypeId) -> Option<u64> {
+        match self.get(id) {
+            Ty::Primitive(p) => Some(primitive_size(*p)),
+            Ty::Void          => Some(0),
+            Ty::Never         => Some(0),
+            Ty::Tuple(fields) => {
+                let mut total = 0u64;
+                for f in fields {
+                    let align = self.align_of(*f)?;
+                    total = align_up(total, align);
+                    total += self.size_of(*f)?;
+                }
+                Some(total)
+            }
+            Ty::Array { elem, len } => Some(self.size_of(*elem)? * len),
+            Ty::Ref { .. } | Ty::Owned(_) | Ty::RawPtr { .. } => Some(8), // pointer size
+            Ty::Slice(_) => Some(16), // fat pointer: ptr + len
+            Ty::Simd { elem, lanes } => Some(self.size_of(*elem)? * *lanes as u64),
+            _ => None, // requires more context for generics
+        }
+    }
+
+    pub fn align_of(&self, id: TypeId) -> Option<u64> {
+        match self.get(id) {
+            Ty::Primitive(p) => Some(primitive_size(*p).min(8)),
+            Ty::Void | Ty::Never => Some(1),
+            Ty::Ref { .. } | Ty::Owned(_) | Ty::RawPtr { .. } => Some(8),
+            Ty::Simd { elem, lanes } => Some((self.size_of(*elem)? * *lanes as u64).min(64)),
+            _ => None,
+        }
+    }
+
+    // ── Numeric coercions ─────────────────────────────────────────────────────
+
+    pub fn is_integer(&self, id: TypeId) -> bool {
+        matches!(self.get(id), Ty::Primitive(p) if p.is_integer())
+    }
+
+    pub fn is_float(&self, id: TypeId) -> bool {
+        matches!(self.get(id), Ty::Primitive(p) if p.is_float())
+    }
+
+    pub fn is_numeric(&self, id: TypeId) -> bool {
+        self.is_integer(id) || self.is_float(id)
+    }
+
+    pub fn is_signed(&self, id: TypeId) -> bool {
+        matches!(self.get(id), Ty::Primitive(p) if p.is_signed())
+    }
+}
+
+fn primitive_size(p: PrimitiveTy) -> u64 {
+    use PrimitiveTy::*;
+    match p {
+        I8   | U8   | Bool | Byte => 1,
+        I16  | U16  | F16        => 2,
+        I32  | U32  | F32  | Char=> 4,
+        I64  | U64  | F64  | Isize | Usize => 8,
+        I128 | U128 | F128       => 16,
+        Str                      => 16, // fat pointer
+    }
+}
+
+fn align_up(offset: u64, align: u64) -> u64 {
+    if align == 0 { return offset; }
+    (offset + align - 1) & !(align - 1)
+}
+
+impl PrimitiveTy {
+    pub fn is_integer(self) -> bool {
+        use PrimitiveTy::*;
+        matches!(self, I8|I16|I32|I64|I128|Isize|U8|U16|U32|U64|U128|Usize)
+    }
+    pub fn is_float(self) -> bool {
+        use PrimitiveTy::*;
+        matches!(self, F16|F32|F64|F128)
+    }
+    pub fn is_signed(self) -> bool {
+        use PrimitiveTy::*;
+        matches!(self, I8|I16|I32|I64|I128|Isize)
+    }
+}
+
+// ─── Default + iteration helpers ─────────────────────────────────────────────
+
+impl Default for TypeCtx {
+    fn default() -> Self { Self::new() }
+}
+
+impl TypeCtx {
+    /// Iterate over all registered struct definitions.
+    pub fn iter_structs(&self) -> impl Iterator<Item = &StructInfo> {
+        self.structs.iter()
+    }
+
+    /// Iterate over all registered enum definitions.
+    pub fn iter_enums(&self) -> impl Iterator<Item = &EnumInfo> {
+        self.enums.iter()
+    }
+
+    /// Number of interned types (built-ins + user-defined).
+    pub fn type_count(&self) -> usize {
+        self.types.len()
+    }
+
+    /// All valid TypeIds currently in this context.
+    pub fn all_type_ids(&self) -> impl Iterator<Item = TypeId> + '_ {
+        (0..self.types.len() as u32).map(TypeId)
+    }
+}

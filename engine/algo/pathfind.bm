@@ -1,0 +1,311 @@
+/// BlackMagic Engine — algo/pathfind.bm
+///
+/// A* pathfinding on a uniform-cost integer grid.
+///   8-directional movement (cardinal cost 1.0, diagonal cost √2)
+///   Octile-distance heuristic — admissible, optimal paths
+///   Binary min-heap open set — O(n log n) per query
+///
+/// Usage:
+///   var grid = PathGrid::new(64, 64);
+///   grid.set_wall(10, 10, true);
+///   var result = PathResult::new(512);
+///   if find_path(&grid, 0, 0, 60, 60, &var result) {
+///       // result.path[0..result.len] = PathStep sequence, start → goal
+///   }
+///   result.free();
+///   grid.free();
+
+use engine::core::math::{ Vec2 };
+use bm::mem::{ alloc_slice, free_slice };
+
+// ─── Binary min-heap ──────────────────────────────────────────────────────────
+
+struct HeapNode {
+    f:   f32,   // g + h — total estimated cost
+    idx: u32,   // cell index = y * width + x
+}
+
+struct MinHeap {
+    data: *var HeapNode,
+    len:  usize,
+    pool_n:  usize,
+}
+
+impl MinHeap {
+    fn new(pool_n: usize) -> MinHeap {
+        let data = alloc_slice::<HeapNode>(pool_n);
+        MinHeap { data, len: 0, pool_n }
+    }
+
+    fn free(self: &var MinHeap) { free_slice(self.data, self.pool_n); }
+
+    fn is_empty(self: &MinHeap) -> bool { self.len == 0 }
+
+    fn push(self: &var MinHeap, node: HeapNode) {
+        if self.len >= self.pool_n { return; }
+        unsafe { *self.data.add(self.len) = node; }
+        // Sift up
+        var i = self.len;
+        self.len += 1;
+        while i > 0 {
+            let p = (i - 1) / 2;
+            if unsafe { (*self.data.add(i)).f >= (*self.data.add(p)).f } { break; }
+            unsafe {
+                let t = *self.data.add(i);
+                *self.data.add(i) = *self.data.add(p);
+                *self.data.add(p) = t;
+            }
+            i = p;
+        }
+    }
+
+    fn pop(self: &var MinHeap) -> HeapNode {
+        let top = unsafe { *self.data.add(0) };
+        self.len -= 1;
+        if self.len > 0 {
+            unsafe { *self.data.add(0) = *self.data.add(self.len); }
+            // Sift down
+            var i: usize = 0;
+            loop {
+                let l = i * 2 + 1;
+                if l >= self.len { break; }
+                var s = i;
+                if unsafe { (*self.data.add(l)).f < (*self.data.add(s)).f } { s = l; }
+                if l + 1 < self.len && unsafe { (*self.data.add(l + 1)).f < (*self.data.add(s)).f } { s = l + 1; }
+                if s == i { break; }
+                unsafe {
+                    let t = *self.data.add(i);
+                    *self.data.add(i) = *self.data.add(s);
+                    *self.data.add(s) = t;
+                }
+                i = s;
+            }
+        }
+        top
+    }
+}
+
+// ─── PathGrid ─────────────────────────────────────────────────────────────────
+
+pub struct PathGrid {
+    pub width:  u32,
+    pub height: u32,
+    cells:      *var u8,   // 0 = passable; 1 = wall
+}
+
+impl PathGrid {
+    pub fn new(width: u32, height: u32) -> PathGrid {
+        let n = (width * height) as usize;
+        let cells = alloc_slice::<u8>(n);
+        var i: usize = 0;
+        while i < n { unsafe { *cells.add(i) = 0; } i += 1; }
+        PathGrid { width, height, cells }
+    }
+
+    pub fn free(self: &var PathGrid) {
+        free_slice(self.cells, (self.width * self.height) as usize);
+    }
+
+    pub fn set_wall(self: &var PathGrid, x: u32, y: u32, wall: bool) {
+        if x < self.width && y < self.height {
+            let v: u8 = if wall { 1 } else { 0 };
+            unsafe { *self.cells.add((y * self.width + x) as usize) = v; }
+        }
+    }
+
+    pub fn is_wall(self: &PathGrid, x: u32, y: u32) -> bool {
+        if x >= self.width || y >= self.height { return true; }
+        unsafe { *self.cells.add((y * self.width + x) as usize) != 0 }
+    }
+
+    /// Flood-fill to check reachability without full A*.
+    pub fn is_reachable(self: &PathGrid, sx: u32, sy: u32, gx: u32, gy: u32) -> bool {
+        if self.is_wall(sx, sy) || self.is_wall(gx, gy) { return false; }
+        let n = (self.width * self.height) as usize;
+        let visited = alloc_slice::<u8>(n);
+        var i: usize = 0;
+        while i < n { unsafe { *visited.add(i) = 0; } i += 1; }
+
+        // BFS queue (use alloc'd array as ring buffer)
+        let qcap = n;
+        let queue = alloc_slice::<u32>(qcap);
+        var head: usize = 0;
+        var tail: usize = 0;
+
+        let start_idx = (sy * self.width + sx) as usize;
+        let goal_idx  = (gy * self.width + gx) as usize;
+        unsafe { *visited.add(start_idx) = 1; *queue.add(tail) = start_idx as u32; }
+        tail += 1;
+
+        var found = false;
+        while head < tail && !found {
+            let cidx = unsafe { *queue.add(head) } as usize;
+            head += 1;
+            if cidx == goal_idx { found = true; }
+            else {
+                let cx = (cidx % self.width as usize) as u32;
+                let cy = (cidx / self.width as usize) as u32;
+                var dy: i32 = -1;
+                while dy <= 1 {
+                    var dx: i32 = -1;
+                    while dx <= 1 {
+                        if dx == 0 && dy == 0 { dx += 1; continue; }
+                        let nx = (cx as i32) + dx;
+                        let ny = (cy as i32) + dy;
+                        if nx >= 0 && ny >= 0 && nx < self.width as i32 && ny < self.height as i32 {
+                            let nidx = ((ny as u32) * self.width + (nx as u32)) as usize;
+                            if unsafe { *visited.add(nidx) } == 0 && !self.is_wall(nx as u32, ny as u32) {
+                                unsafe { *visited.add(nidx) = 1; *queue.add(tail) = nidx as u32; }
+                                tail += 1;
+                            }
+                        }
+                        dx += 1;
+                    }
+                    dy += 1;
+                }
+            }
+        }
+
+        free_slice(visited, n);
+        free_slice(queue, qcap);
+        found
+    }
+}
+
+// ─── PathResult ───────────────────────────────────────────────────────────────
+
+pub struct PathStep { pub x: u32, pub y: u32 }
+
+pub struct PathResult {
+    pub path: *var PathStep,
+    pub len:  usize,
+    pool_n:      usize,
+}
+
+impl PathResult {
+    pub fn new(pool_n: usize) -> PathResult {
+        let path = alloc_slice::<PathStep>(pool_n);
+        PathResult { path, len: 0, pool_n }
+    }
+
+    pub fn free(self: &var PathResult)  { free_slice(self.path, self.pool_n); }
+    pub fn clear(self: &var PathResult) { self.len = 0; }
+}
+
+// ─── A* ───────────────────────────────────────────────────────────────────────
+
+fn heuristic(x1: u32, y1: u32, x2: u32, y2: u32) -> f32 {
+    // Octile distance — admissible for 8-directional uniform-cost grids
+    let dx = if x1 > x2 { (x1 - x2) as f32 } else { (x2 - x1) as f32 };
+    let dy = if y1 > y2 { (y1 - y2) as f32 } else { (y2 - y1) as f32 };
+    var mn: f32 = 0.0;
+    var mx: f32 = 0.0;
+    if dx < dy { mn = dx; mx = dy; } else { mn = dy; mx = dx; }
+    mx + 0.41421356 * mn   // = max + (√2 - 1) * min
+}
+
+/// Find shortest path from (sx,sy) to (gx,gy).
+/// Fills result.path[0..result.len] with steps from start to goal.
+/// Returns true on success, false if no path exists.
+#[sicko]
+pub fn find_path(grid: &PathGrid,
+                 sx: u32, sy: u32, gx: u32, gy: u32,
+                 result: &var PathResult) -> bool {
+    result.clear();
+    if grid.is_wall(sx, sy) || grid.is_wall(gx, gy) { return false; }
+    if sx == gx && sy == gy { return true; }
+
+    let n = (grid.width * grid.height) as usize;
+    let g_scores  = alloc_slice::<f32>(n);
+    let parents   = alloc_slice::<u32>(n);
+    let in_closed = alloc_slice::<u8>(n);
+
+    var i: usize = 0;
+    while i < n {
+        unsafe { *g_scores.add(i) = 1e30; *parents.add(i) = 0xFFFFFFFF; *in_closed.add(i) = 0; }
+        i += 1;
+    }
+
+    let start_idx = (sy * grid.width + sx) as usize;
+    let goal_idx  = (gy * grid.width + gx) as usize;
+    unsafe { *g_scores.add(start_idx) = 0.0; }
+
+    var heap = MinHeap::new(n + 4);
+    heap.push(HeapNode { f: heuristic(sx, sy, gx, gy), idx: start_idx as u32 });
+
+    var found = false;
+    while !heap.is_empty() && !found {
+        let cur  = heap.pop();
+        let cidx = cur.idx as usize;
+        if cidx == goal_idx { found = true; }
+        else {
+            if unsafe { *in_closed.add(cidx) } != 0 { continue; }
+            unsafe { *in_closed.add(cidx) = 1; }
+
+            let cx = (cidx % grid.width as usize) as u32;
+            let cy = (cidx / grid.width as usize) as u32;
+
+            var dy: i32 = -1;
+            while dy <= 1 {
+                var dx: i32 = -1;
+                while dx <= 1 {
+                    if dx == 0 && dy == 0 { dx += 1; continue; }
+                    let nx = (cx as i32) + dx;
+                    let ny = (cy as i32) + dy;
+                    if nx < 0 || ny < 0 || nx >= grid.width as i32 || ny >= grid.height as i32 {
+                        dx += 1; continue;
+                    }
+                    let nxu = nx as u32;
+                    let nyu = ny as u32;
+                    if grid.is_wall(nxu, nyu) { dx += 1; continue; }
+                    let nidx = (nyu * grid.width + nxu) as usize;
+                    if unsafe { *in_closed.add(nidx) } != 0 { dx += 1; continue; }
+
+                    // Diagonal cost √2, cardinal cost 1
+                    let step = if dx != 0 && dy != 0 { 1.41421356 } else { 1.0 };
+                    let new_g = unsafe { *g_scores.add(cidx) } + step;
+                    if new_g < unsafe { *g_scores.add(nidx) } {
+                        unsafe { *g_scores.add(nidx) = new_g; *parents.add(nidx) = cidx as u32; }
+                        heap.push(HeapNode { f: new_g + heuristic(nxu, nyu, gx, gy), idx: nidx as u32 });
+                    }
+                    dx += 1;
+                }
+                dy += 1;
+            }
+        }
+    }
+
+    if found {
+        // Reconstruct: walk parent chain goal → start, then reverse
+        var node = goal_idx as u32;
+        while node != 0xFFFFFFFF {
+            if result.len < result.pool_n {
+                let nx = node % grid.width;
+                let ny = node / grid.width;
+                unsafe { *result.path.add(result.len) = PathStep { x: nx, y: ny }; }
+                result.len += 1;
+            }
+            let p = unsafe { *parents.add(node as usize) };
+            if p == node { break; }
+            node = p;
+        }
+        // Reverse to get start → goal order
+        var lo: usize = 0;
+        var hi = result.len - 1;
+        while lo < hi {
+            unsafe {
+                let t = *result.path.add(lo);
+                *result.path.add(lo) = *result.path.add(hi);
+                *result.path.add(hi) = t;
+            }
+            lo += 1;
+            if hi > 0 { hi -= 1; }
+        }
+    }
+
+    heap.free();
+    free_slice(g_scores, n);
+    free_slice(parents, n);
+    free_slice(in_closed, n);
+    found
+}

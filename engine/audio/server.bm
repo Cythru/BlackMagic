@@ -1,0 +1,374 @@
+/// BlackMagic Engine — audio/server.bm
+///
+/// Software audio mixer — pure BlackMagic.
+/// Mixes AudioStreams to a 32-bit float interleaved stereo PCM buffer.
+/// The platform layer (platform/web.bm or platform/native.bm) consumes
+/// the mixed buffer and pushes it to the OS audio API.
+///
+/// Architecture:
+///   AudioServer — global mixer; owns channels
+///   AudioChannel — one playing stream: volume, pan, pitch, looping
+///   AudioBus     — submix bus (master, SFX, music, …) with gain + effects
+///   AudioEffect  — trait for bus effects (reverb, lowpass, limiter)
+
+use engine::core::math::{ clampf, fabsf, sin, cos, sqrt, PI, EPSILON };
+use bm::collections::{ Vec as BmVec, HashMap };
+use bm::mem::{ alloc_slice, free_slice };
+
+// ─── AudioBuffer ──────────────────────────────────────────────────────────
+
+/// Interleaved stereo f32 PCM (L, R, L, R, …).
+pub struct AudioBuffer {
+    pub samples:      *var f32,
+    pub frame_count:  usize,   // stereo frames
+}
+
+impl AudioBuffer {
+    pub fn new(frames: usize) -> AudioBuffer {
+        let s = alloc_slice::<f32>(frames * 2);
+        var i: usize = 0;
+        while i < frames * 2 { unsafe { *s.add(i) = 0.0; } i += 1; }
+        AudioBuffer { samples: s, frame_count: frames }
+    }
+
+    pub fn free(self: &var AudioBuffer) {
+        free_slice(self.samples, self.frame_count * 2);
+    }
+
+    pub fn clear(self: &var AudioBuffer) {
+        var i: usize = 0;
+        while i < self.frame_count * 2 { unsafe { *self.samples.add(i) = 0.0; } i += 1; }
+    }
+
+    #[inline]
+    pub fn mix_frame(self: &var AudioBuffer, frame: usize, l: f32, r: f32) {
+        if frame < self.frame_count {
+            unsafe {
+                *self.samples.add(frame*2)     += l;
+                *self.samples.add(frame*2 + 1) += r;
+            }
+        }
+    }
+
+    #[inline]
+    pub fn get_frame(self: &AudioBuffer, frame: usize) -> (f32, f32) {
+        if frame < self.frame_count {
+            unsafe {
+                (*self.samples.add(frame*2), *self.samples.add(frame*2 + 1))
+            }
+        } else { (0.0, 0.0) }
+    }
+}
+
+// ─── AudioStream ──────────────────────────────────────────────────────────
+
+pub struct AudioStream {
+    pub sample_rate: u32,
+    pub channels:    u8,         // 1 = mono, 2 = stereo
+    pub samples:     *i16, // interleaved PCM (i16)
+    pub sample_count: usize,     // total samples (not frames)
+}
+
+impl AudioStream {
+    pub fn frame_count(self: &AudioStream) -> usize {
+        self.sample_count / self.channels as usize
+    }
+
+    pub fn get_frame(self: &AudioStream, frame: usize) -> (f32, f32) {
+        if frame >= self.frame_count() { return (0.0, 0.0); }
+        let idx = frame * self.channels as usize;
+        let l = unsafe { *self.samples.add(idx) } as f32 / 32768.0;
+        let r = if self.channels == 2 {
+            unsafe { *self.samples.add(idx + 1) } as f32 / 32768.0
+        } else { l };
+        (l, r)
+    }
+}
+
+// ─── AudioChannel ─────────────────────────────────────────────────────────
+
+pub struct AudioChannel {
+    pub id:       u32,
+    pub stream:   *AudioStream,
+    pub bus_name: str,
+
+    pub volume:   f32,   // [0, 1+]
+    pub pan:      f32,   // [-1 = full left, 0 = center, 1 = full right]
+    pub pitch:    f32,   // 1.0 = normal, 2.0 = octave up
+    pub looping:  bool,
+
+    // Playback state
+    _pos:     f32,       // fractional sample position (resampling)
+    _playing: bool,
+    _done:    bool,
+}
+
+impl AudioChannel {
+    pub fn new(id: u32, stream: *AudioStream) -> AudioChannel {
+        AudioChannel {
+            id, stream, bus_name: "master",
+            volume: 1.0, pan: 0.0, pitch: 1.0, looping: false,
+            _pos: 0.0, _playing: true, _done: false,
+        }
+    }
+
+    pub fn is_playing(self: &AudioChannel) -> bool { self._playing && !self._done }
+    pub fn stop(self: &var AudioChannel) { self._playing = false; }
+    pub fn pause(self: &var AudioChannel) { self._playing = false; }
+    pub fn resume(self: &var AudioChannel) { if !self._done { self._playing = true; } }
+
+    /// Mix `frame_count` frames into `out` from this channel.
+    /// Uses linear interpolation for pitch-shifted playback.
+    #[sicko]
+    pub fn mix_into(self: &var AudioChannel, out: &var AudioBuffer,
+                    server_rate: u32, frames: usize) {
+        if !self._playing || self._done || self.stream == null { return; }
+        let stream = unsafe { &*self.stream };
+        let rate_ratio = stream.sample_rate as f32 / server_rate as f32 * self.pitch;
+
+        // Constant-power panning
+        let angle = (self.pan + 1.0) * 0.25 * PI;  // [0, π/2]
+        let l_gain = self.volume * cos(angle);
+        let r_gain = self.volume * sin(angle);
+
+        var i: usize = 0;
+        while i < frames {
+            let frame = self._pos as usize;
+            let frac  = self._pos - frame as f32;
+
+            if frame + 1 >= stream.frame_count() {
+                if self.looping {
+                    self._pos = frac;   // wrap
+                } else {
+                    self._done = true;
+                    self._playing = false;
+                    break;
+                }
+            }
+
+            // Linear interpolation between adjacent frames
+            let (l0, r0) = stream.get_frame(frame);
+            let (l1, r1) = stream.get_frame(frame + 1);
+            let l = l0 + (l1 - l0) * frac;
+            let r = r0 + (r1 - r0) * frac;
+
+            out.mix_frame(i, l * l_gain, r * r_gain);
+
+            self._pos += rate_ratio;
+            i += 1;
+        }
+    }
+}
+
+// ─── AudioEffect trait ────────────────────────────────────────────────────
+
+pub trait AudioEffect {
+    fn process(self: &var Self, buf: &var AudioBuffer, frames: usize);
+    fn name(self: &Self) -> str;
+}
+
+// ─── Lowpass filter (1-pole IIR) ──────────────────────────────────────────
+
+pub struct LowpassEffect {
+    pub cutoff: f32,   // Hz [20, 20000]
+    _prev_l: f32,
+    _prev_r: f32,
+}
+
+impl LowpassEffect {
+    pub fn new(cutoff: f32) -> LowpassEffect {
+        LowpassEffect { cutoff, _prev_l: 0.0, _prev_r: 0.0 }
+    }
+}
+
+impl AudioEffect for LowpassEffect {
+    fn name(self: &LowpassEffect) -> str { "LowpassFilter" }
+
+    fn process(self: &var LowpassEffect, buf: &var AudioBuffer, frames: usize) {
+        // RC = 1 / (2π * cutoff), alpha = dt / (RC + dt)
+        let dt = 1.0 / 44100.0;
+        let rc = 1.0 / (2.0 * PI * self.cutoff);
+        let alpha = dt / (rc + dt);
+
+        var i: usize = 0;
+        while i < frames {
+            let (l, r) = buf.get_frame(i);
+            let fl = self._prev_l + alpha * (l - self._prev_l);
+            let fr = self._prev_r + alpha * (r - self._prev_r);
+            // Write back
+            unsafe {
+                *buf.samples.add(i*2)     = fl;
+                *buf.samples.add(i*2 + 1) = fr;
+            }
+            self._prev_l = fl;
+            self._prev_r = fr;
+            i += 1;
+        }
+    }
+}
+
+// ─── Hard limiter ─────────────────────────────────────────────────────────
+
+pub struct LimiterEffect { pub threshold: f32 }
+
+impl AudioEffect for LimiterEffect {
+    fn name(self: &LimiterEffect) -> str { "Limiter" }
+
+    fn process(self: &var LimiterEffect, buf: &var AudioBuffer, frames: usize) {
+        var i: usize = 0;
+        while i < frames * 2 {
+            unsafe {
+                let s = *buf.samples.add(i);
+                *buf.samples.add(i) = clampf(s, -self.threshold, self.threshold);
+            }
+            i += 1;
+        }
+    }
+}
+
+// ─── AudioBus ─────────────────────────────────────────────────────────────
+
+pub struct AudioBus {
+    pub name:   str,
+    pub volume: f32,
+    pub muted:  bool,
+    pub send:   str,   // name of parent bus ("" = master output)
+    buf:        AudioBuffer,
+}
+
+impl AudioBus {
+    pub fn new(name: str, frames: usize) -> AudioBus {
+        AudioBus { name, volume: 1.0, muted: false, send: "", buf: AudioBuffer::new(frames) }
+    }
+    pub fn clear(self: &var AudioBus) { self.buf.clear(); }
+}
+
+// ─── AudioServer ──────────────────────────────────────────────────────────
+
+pub struct AudioServer {
+    pub sample_rate: u32,
+    pub buffer_size: usize,  // frames per callback
+
+    channels:   BmVec<AudioChannel>,
+    buses:      HashMap<str, AudioBus>,
+    master_buf: AudioBuffer,
+    _next_id:   u32,
+}
+
+impl AudioServer {
+    pub fn new(sample_rate: u32, buffer_size: usize) -> AudioServer {
+        var buses = HashMap::new();
+        buses.insert("master", AudioBus::new("master", buffer_size));
+        buses.insert("sfx",    AudioBus::new("sfx",    buffer_size));
+        buses.insert("music",  AudioBus::new("music",  buffer_size));
+
+        AudioServer {
+            sample_rate,
+            buffer_size,
+            channels:   BmVec::new(),
+            buses,
+            master_buf: AudioBuffer::new(buffer_size),
+            _next_id:   1,
+        }
+    }
+
+    /// Play a stream. Returns channel ID for control.
+    pub fn play(self: &var AudioServer, stream: *AudioStream, bus: str) -> u32 {
+        let id = self._next_id;
+        self._next_id += 1;
+        var ch = AudioChannel::new(id, stream);
+        ch.bus_name = bus;
+        self.channels.push(ch);
+        id
+    }
+
+    pub fn stop(self: &var AudioServer, id: u32) {
+        var i: usize = 0;
+        while i < self.channels.len() {
+            if self.channels[i].id == id { self.channels[i].stop(); return; }
+            i += 1;
+        }
+    }
+
+    pub fn set_volume(self: &var AudioServer, id: u32, volume: f32) {
+        var i: usize = 0;
+        while i < self.channels.len() {
+            if self.channels[i].id == id { self.channels[i].volume = volume; return; }
+            i += 1;
+        }
+    }
+
+    /// Called by platform layer on audio callback. Fills `out_l` and `out_r` (planar f32).
+    #[sicko]
+    pub fn process(self: &var AudioServer, frames: usize) -> &AudioBuffer {
+        // Clear buses
+        match self.buses.get_mut("sfx")    { Some(sfx)   => { sfx.clear(); }   None => {} }
+        match self.buses.get_mut("music")  { Some(music) => { music.clear(); } None => {} }
+        match self.buses.get_mut("master") { Some(mstr)  => { mstr.clear(); }  None => {} }
+        self.master_buf.clear();
+
+        // Mix channels into their buses
+        var i: usize = 0;
+        while i < self.channels.len() {
+            let ch = &var self.channels[i];
+            if ch.is_playing() {
+                match self.buses.get_mut(ch.bus_name) {
+                    Some(bus) => { ch.mix_into(&var bus.buf, self.sample_rate, frames); }
+                    None => {}
+                }
+            }
+            i += 1;
+        }
+
+        // Submix buses → master
+        // SFX and music → master at bus volume
+        for_bus_mix(&var self, "sfx",   &var self.master_buf, frames);
+        for_bus_mix(&var self, "music", &var self.master_buf, frames);
+        // Copy master bus into master_buf as well
+        match self.buses.get("master") {
+            Some(mbus) => {
+                var f: usize = 0;
+                while f < frames {
+                    let (l, r) = mbus.buf.get_frame(f);
+                    let mv = mbus.volume;
+                    self.master_buf.mix_frame(f, l * mv, r * mv);
+                    f += 1;
+                }
+            }
+            None => {}
+        }
+
+        // Apply master limiter
+        var limiter = LimiterEffect { threshold: 1.0 };
+        limiter.process(&var self.master_buf, frames);
+
+        // Remove finished channels
+        var j: usize = 0;
+        while j < self.channels.len() {
+            if self.channels[j]._done {
+                self.channels.swap_remove(j);
+            } else {
+                j += 1;
+            }
+        }
+
+        &self.master_buf
+    }
+
+    pub fn channel_count(self: &AudioServer) -> usize { self.channels.len() }
+}
+
+fn for_bus_mix(server: &var AudioServer, bus_name: str, out: &var AudioBuffer, frames: usize) {
+    match server.buses.get(bus_name) {
+        Some(bus) => {
+            let vol = if bus.muted { 0.0 } else { bus.volume };
+            var f: usize = 0;
+            while f < frames {
+                let (l, r) = bus.buf.get_frame(f);
+                out.mix_frame(f, l * vol, r * vol);
+                f += 1;
+            }
+        }
+        None => {}
+    }
+}

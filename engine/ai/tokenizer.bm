@@ -1,0 +1,237 @@
+/// BlackMagic Engine — ai/tokenizer.bm
+///
+/// BPE tokenizer for LLM inference.
+/// Supports UTF-8 text → token IDs (encode) and IDs → UTF-8 (decode).
+/// Vocab and merge table loaded from GGUF metadata via model.bm.
+///
+/// Special tokens: BOS=1, EOS=2, PAD=0 (overridable via TokenizerConfig).
+
+use bm::mem::{ alloc_slice, free_slice };
+
+// ─── Special tokens ───────────────────────────────────────────────────────────
+
+pub const TOKEN_PAD: u32 = 0;
+pub const TOKEN_BOS: u32 = 1;
+pub const TOKEN_EOS: u32 = 2;
+
+// ─── Configuration ────────────────────────────────────────────────────────────
+
+pub struct TokenizerConfig {
+    pub bos_id:      u32,
+    pub eos_id:      u32,
+    pub pad_id:      u32,
+    pub add_bos:     bool,
+    pub add_eos:     bool,
+}
+
+impl TokenizerConfig {
+    pub fn default() -> TokenizerConfig {
+        TokenizerConfig {
+            bos_id: TOKEN_BOS,
+            eos_id: TOKEN_EOS,
+            pad_id: TOKEN_PAD,
+            add_bos: true,
+            add_eos: false,
+        }
+    }
+}
+
+// ─── Vocab ────────────────────────────────────────────────────────────────────
+
+/// Vocabulary table.
+/// `tokens` — concatenated UTF-8 token strings (no nulls).
+/// `offsets[i]` — byte offset of token i in `tokens`.
+/// `offsets[i+1] - offsets[i]` = length of token i.
+/// `scores[i]` — BPE score (log-prob) for token i.
+pub struct Vocab {
+    pub tokens:  *u8,
+    pub offsets: *u32,
+    pub scores:  *f32,
+    pub n:       u32,
+}
+
+impl Vocab {
+    /// Get the byte slice for token id (ptr + len).
+    pub fn token_bytes(self: &Vocab, id: u32) -> (*u8, u32) {
+        let off = unsafe { *self.offsets.add(id as usize) };
+        let end = unsafe { *self.offsets.add(id as usize + 1) };
+        let len = end - off;
+        (unsafe { self.tokens.add(off as usize) }, len)
+    }
+
+    /// Linear scan for exact token string match. Returns vocab size if not found.
+    pub fn find(self: &Vocab, text: *u8, text_len: u32) -> u32 {
+        var i: u32 = 0;
+        while i < self.n {
+            let (tok_ptr, tok_len) = self.token_bytes(i);
+            if tok_len == text_len && bytes_eq(tok_ptr, text, text_len as usize) {
+                return i;
+            }
+            i += 1;
+        }
+        self.n  // not found
+    }
+}
+
+// ─── Merge pair ───────────────────────────────────────────────────────────────
+
+pub struct MergePair {
+    pub left:  u32,
+    pub right: u32,
+    pub rank:  u32,   // lower = higher priority
+}
+
+// ─── Tokenizer ────────────────────────────────────────────────────────────────
+
+pub struct Tokenizer {
+    pub vocab:    Vocab,
+    pub merges:   *var MergePair,
+    pub n_merges: u32,
+    pub config:   TokenizerConfig,
+}
+
+impl Tokenizer {
+    /// Encode UTF-8 text into token IDs using BPE.
+    /// Writes into `ids_out`; returns number of tokens written (≤ max_len).
+    /// If config.add_bos, prepends BOS token.
+    pub fn encode(self: &Tokenizer, text: *u8, text_len: usize, ids_out: *var u32, max_len: usize) -> usize {
+        // Allocate working symbol array (worst case: one token per byte).
+        let sym_cap = text_len + 2;  // +2 for BOS/EOS
+        let syms: *var u32 = unsafe { alloc_slice::<u32>(sym_cap) };
+        var n_syms: usize = 0;
+
+        // BOS
+        if self.config.add_bos && n_syms < sym_cap {
+            unsafe { *syms.add(n_syms) = self.config.bos_id; }
+            n_syms += 1;
+        }
+
+        // Byte-level initialisation: map each UTF-8 byte to its vocab token.
+        var i: usize = 0;
+        while i < text_len && n_syms < sym_cap {
+            let byte_val = unsafe { *text.add(i) };
+            // Single-byte token lookup
+            let tok_id = self.vocab.find(text.add(i), 1);
+            let id = if tok_id < self.vocab.n { tok_id } else { byte_val as u32 };
+            unsafe { *syms.add(n_syms) = id; }
+            n_syms += 1;
+            i += 1;
+        }
+
+        // BPE merge loop: repeatedly find the highest-priority adjacent pair.
+        loop {
+            var best_rank: u32 = 0xFFFFFFFF;
+            var best_pos:  usize = n_syms;  // invalid sentinel
+
+            var j: usize = 0;
+            while j + 1 < n_syms {
+                let l = unsafe { *syms.add(j) };
+                let r = unsafe { *syms.add(j + 1) };
+                // Find merge rank for (l, r)
+                let rank = find_merge_rank(self.merges, self.n_merges, l, r);
+                if rank < best_rank {
+                    best_rank = rank;
+                    best_pos  = j;
+                }
+                j += 1;
+            }
+
+            if best_pos >= n_syms { break; }  // no more merges
+
+            // Find merged token id for the pair at best_pos
+            let l = unsafe { *syms.add(best_pos) };
+            let r = unsafe { *syms.add(best_pos + 1) };
+            let merged = find_merged_token(&self.vocab, l, r);
+            if merged >= self.vocab.n { break; }
+
+            // Replace pair with merged token, shift rest left
+            unsafe { *syms.add(best_pos) = merged; }
+            var k = best_pos + 1;
+            while k + 1 < n_syms {
+                unsafe { *syms.add(k) = *syms.add(k + 1); }
+                k += 1;
+            }
+            n_syms -= 1;
+        }
+
+        // EOS
+        if self.config.add_eos && n_syms < sym_cap {
+            unsafe { *syms.add(n_syms) = self.config.eos_id; }
+            n_syms += 1;
+        }
+
+        // Copy to output
+        let out_n = if n_syms < max_len { n_syms } else { max_len };
+        var q: usize = 0;
+        while q < out_n {
+            unsafe { *ids_out.add(q) = *syms.add(q); }
+            q += 1;
+        }
+
+        unsafe { free_slice::<u32>(syms, sym_cap); }
+        out_n
+    }
+
+    /// Decode token IDs back to UTF-8 text.
+    /// Writes into `out_buf`; returns number of bytes written.
+    pub fn decode(self: &Tokenizer, ids: *u32, n: usize, out_buf: *var u8, buf_len: usize) -> usize {
+        var written: usize = 0;
+        var i: usize = 0;
+        while i < n {
+            let id = unsafe { *ids.add(i) };
+            // Skip BOS/EOS/PAD
+            if id == self.config.bos_id || id == self.config.eos_id || id == self.config.pad_id {
+                i += 1;
+                continue;
+            }
+            if id < self.vocab.n {
+                let (tok_ptr, tok_len) = self.vocab.token_bytes(id);
+                var b: u32 = 0;
+                while b < tok_len && written < buf_len {
+                    unsafe { *out_buf.add(written) = *tok_ptr.add(b as usize); }
+                    written += 1;
+                    b += 1;
+                }
+            }
+            i += 1;
+        }
+        written
+    }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+fn find_merge_rank(merges: *var MergePair, n: u32, left: u32, right: u32) -> u32 {
+    var i: u32 = 0;
+    while i < n {
+        let m = unsafe { &*merges.add(i as usize) };
+        if m.left == left && m.right == right { return m.rank; }
+        i += 1;
+    }
+    0xFFFFFFFF  // not a merge pair
+}
+
+fn find_merged_token(vocab: &Vocab, left: u32, right: u32) -> u32 {
+    // Build concatenated token string and look it up.
+    // Reuse a small stack buffer (max 128 bytes per merged token).
+    let buf: [u8; 256] = [0u8; 256];
+    let bufp = &buf as *var u8;
+    let (lp, ll) = vocab.token_bytes(left);
+    let (rp, rl) = vocab.token_bytes(right);
+    if (ll + rl) as usize > 255 { return vocab.n; }
+    var bi: usize = 0;
+    var li: u32 = 0;
+    while li < ll { unsafe { *bufp.add(bi) = *lp.add(li as usize); } bi += 1; li += 1; }
+    var ri: u32 = 0;
+    while ri < rl { unsafe { *bufp.add(bi) = *rp.add(ri as usize); } bi += 1; ri += 1; }
+    vocab.find(bufp as *u8, (ll + rl))
+}
+
+fn bytes_eq(a: *u8, b: *u8, n: usize) -> bool {
+    var i: usize = 0;
+    while i < n {
+        if unsafe { *a.add(i) != *b.add(i) } { return false; }
+        i += 1;
+    }
+    true
+}

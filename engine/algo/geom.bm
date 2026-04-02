@@ -1,0 +1,219 @@
+/// BlackMagic Engine — algo/geom.bm
+///
+/// 2D computational geometry primitives.
+///
+///   segment_intersect   — test + find crossing point of two line segments
+///   point_in_polygon    — ray-cast inclusion test (arbitrary simple polygon)
+///   polygon_area        — signed area via shoelace; positive = CCW winding
+///   convex_hull         — Graham scan, in-place on provided scratch buffer
+///   closest_point_seg   — nearest point on a line segment to a query point
+///   point_in_circle     — trivial circle containment
+///   circle_circle_hit   — circle-circle overlap test
+///
+/// All geometry uses engine::core::math::Vec2 (f32, f32).
+///
+/// Usage:
+///   use engine::algo::geom;
+///   let hit = geom::segment_intersect(a0, a1, b0, b1, &var pt);
+///   let inside = geom::point_in_polygon(p, verts, vert_count);
+
+use engine::core::math::{ Vec2 };
+use bm::mem::{ alloc_slice, free_slice };
+
+// ─── Segment intersection ─────────────────────────────────────────────────────
+
+/// Test whether segment (p0, p1) and segment (q0, q1) intersect.
+/// If they do and `out` is not null, writes the intersection point to *out.
+/// Collinear / touching endpoints: returns false (conservative).
+pub fn segment_intersect(p0: Vec2, p1: Vec2, q0: Vec2, q1: Vec2, out: *var Vec2) -> bool {
+    let dx1 = p1.x - p0.x;
+    let dy1 = p1.y - p0.y;
+    let dx2 = q1.x - q0.x;
+    let dy2 = q1.y - q0.y;
+
+    let denom = dx1 * dy2 - dy1 * dx2;
+    if denom == 0.0 { return false; }   // parallel or collinear
+
+    let dx3 = q0.x - p0.x;
+    let dy3 = q0.y - p0.y;
+
+    let t = (dx3 * dy2 - dy3 * dx2) / denom;
+    let u = (dx3 * dy1 - dy3 * dx1) / denom;
+
+    if t > 0.0 && t < 1.0 && u > 0.0 && u < 1.0 {
+        if out as usize != 0 {
+            unsafe {
+                (*out).x = p0.x + t * dx1;
+                (*out).y = p0.y + t * dy1;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+// ─── Point in polygon ─────────────────────────────────────────────────────────
+
+/// Ray-cast inclusion test.
+/// `verts` — pointer to `count` Vec2 vertices in CCW or CW winding order.
+/// Returns true if p is strictly inside the polygon.
+/// Points on edges / vertices: result is unspecified (not guaranteed to be true).
+pub fn point_in_polygon(p: Vec2, verts: *Vec2, count: usize) -> bool {
+    if count < 3 { return false; }
+    var inside = false;
+    var j = count - 1;
+    var i: usize = 0;
+    while i < count {
+        let vi = unsafe { *verts.add(i) };
+        let vj = unsafe { *verts.add(j) };
+        // Edge vj → vi: check if horizontal ray from p crosses this edge
+        if (vi.y > p.y) != (vj.y > p.y) {
+            let cross_x = (vj.x - vi.x) * (p.y - vi.y) / (vj.y - vi.y) + vi.x;
+            if p.x < cross_x { inside = !inside; }
+        }
+        j = i;
+        i += 1;
+    }
+    inside
+}
+
+// ─── Polygon area ─────────────────────────────────────────────────────────────
+
+/// Signed area via the shoelace formula.
+///   Positive  → CCW winding
+///   Negative  → CW winding
+/// Absolute value = actual area.
+pub fn polygon_area(verts: *Vec2, count: usize) -> f32 {
+    if count < 3 { return 0.0; }
+    var area: f32 = 0.0;
+    var j = count - 1;
+    var i: usize = 0;
+    while i < count {
+        let vi = unsafe { *verts.add(i) };
+        let vj = unsafe { *verts.add(j) };
+        area += vj.x * vi.y - vi.x * vj.y;
+        j = i;
+        i += 1;
+    }
+    area * 0.5
+}
+
+// ─── Convex hull — Graham scan ────────────────────────────────────────────────
+
+/// Compute the convex hull of `n` points.
+/// Writes hull vertices (CCW) into `hull` (caller must ensure hull is big enough;
+/// hull size ≤ n).  Returns hull vertex count.
+///
+/// Notes:
+///   • Sorts `pts` in-place as a side effect.
+///   • Duplicate / collinear points: collinear points are excluded from hull edges
+///     (strict turn test), so the hull has only "corner" vertices.
+#[sicko]
+pub fn convex_hull(pts: *var Vec2, n: usize, hull: *var Vec2) -> usize {
+    if n < 3 { return 0; }
+
+    // Find pivot: lowest y, then leftmost
+    var pivot = 0;
+    var k: usize = 1;
+    while k < n {
+        let p = unsafe { *pts.add(k) };
+        let q = unsafe { *pts.add(pivot) };
+        if p.y < q.y || (p.y == q.y && p.x < q.x) { pivot = k; }
+        k += 1;
+    }
+    unsafe {
+        let t = *pts.add(0);
+        *pts.add(0) = *pts.add(pivot);
+        *pts.add(pivot) = t;
+    }
+
+    let p0 = unsafe { *pts.add(0) };
+
+    // Sort remaining pts[1..n] by polar angle around p0
+    // Insertion sort (n is generally small for convex hull in game contexts)
+    var si: usize = 2;
+    while si < n {
+        let cur = unsafe { *pts.add(si) };
+        var sj = si;
+        while sj > 1 {
+            let prev = unsafe { *pts.add(sj - 1) };
+            // cross(prev-p0, cur-p0) < 0 → cur is clockwise of prev → swap
+            let ax = prev.x - p0.x;
+            let ay = prev.y - p0.y;
+            let bx = cur.x  - p0.x;
+            let by_ = cur.y - p0.y;
+            let cross = ax * by_ - ay * bx;
+            if cross < 0.0 {
+                unsafe { *pts.add(sj) = prev; }
+                sj -= 1;
+            } else { break; }
+        }
+        unsafe { *pts.add(sj) = cur; }
+        si += 1;
+    }
+
+    // Graham scan
+    let stack = alloc_slice::<usize>(n + 2);
+    var sp: usize = 0;
+    unsafe { *stack.add(sp) = 0; } sp += 1;
+    unsafe { *stack.add(sp) = 1; } sp += 1;
+
+    var idx: usize = 2;
+    while idx < n {
+        // While last three points make a non-left (CW or collinear) turn, pop
+        while sp >= 2 {
+            let a = unsafe { *pts.add(*stack.add(sp - 2)) };
+            let b = unsafe { *pts.add(*stack.add(sp - 1)) };
+            let c = unsafe { *pts.add(idx) };
+            let cross = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+            if cross <= 0.0 { sp -= 1; } else { break; }
+        }
+        unsafe { *stack.add(sp) = idx; }
+        sp += 1;
+        idx += 1;
+    }
+
+    // Copy hull
+    var hi: usize = 0;
+    while hi < sp {
+        let src_idx = unsafe { *stack.add(hi) };
+        unsafe { *hull.add(hi) = *pts.add(src_idx); }
+        hi += 1;
+    }
+
+    free_slice(stack, n + 2);
+    sp
+}
+
+// ─── Closest point on segment ─────────────────────────────────────────────────
+
+/// Nearest point on segment (a, b) to query point p.
+pub fn closest_point_seg(p: Vec2, a: Vec2, b: Vec2) -> Vec2 {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let len2 = dx * dx + dy * dy;
+    if len2 == 0.0 { return a; }
+    var t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2;
+    if t < 0.0 { t = 0.0; }
+    if t > 1.0 { t = 1.0; }
+    Vec2 { x: a.x + t * dx, y: a.y + t * dy }
+}
+
+// ─── Circle tests ─────────────────────────────────────────────────────────────
+
+/// Returns true if point p is inside (or on the boundary of) the circle.
+#[inline]
+pub fn point_in_circle(p: Vec2, center: Vec2, radius: f32) -> bool {
+    let dx = p.x - center.x;
+    let dy = p.y - center.y;
+    dx * dx + dy * dy <= radius * radius
+}
+
+/// Returns true if two circles overlap (distance between centres < r1 + r2).
+#[inline]
+pub fn circle_circle_hit(c1: Vec2, r1: f32, c2: Vec2, r2: f32) -> bool {
+    let dx = c1.x - c2.x;
+    let dy = c1.y - c2.y;
+    let rsum = r1 + r2;
+    dx * dx + dy * dy < rsum * rsum
+}

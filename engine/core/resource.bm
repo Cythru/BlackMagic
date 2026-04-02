@@ -1,0 +1,272 @@
+/// BlackMagic Engine — core/resource.bm
+///
+/// Resource system: reference-counted heap objects, typed RID handles,
+/// asset loading/saving, and the ResourceCache (Godot-style).
+///
+/// Resources are anything that can be serialised and referenced:
+///   textures, meshes, materials, audio streams, scripts, tilemaps …
+///
+/// Key types:
+///   RID<T>          — opaque typed 64-bit handle (no raw pointer leaks)
+///   Rc<T>           — reference-counted smart pointer
+///   Resource        — base trait for loadable assets
+///   ResourceLoader  — async-capable multi-format loader
+///   ResourceCache   — global path → RID map
+
+use bm::collections::{ HashMap, Vec as BmVec };
+use bm::sync::AtomicU32;
+
+// ─── RID ───────────────────────────────────────────────────────────────────
+//
+// Resource IDs are 64-bit integers split as:
+//   [  32-bit generation  |  16-bit type tag  |  16-bit slot index  ]
+//
+// Generation prevents use-after-free: stale RIDs fail validity checks.
+
+pub struct RID<T> {
+    raw: u64,
+}
+
+impl<T> RID<T> {
+    pub fn make_null() -> RID<T> { RID { raw: 0 } }
+    pub fn is_null(self) -> bool { self.raw == 0 }
+
+    fn make(slot: u16, type_tag: u16, gen: u32) -> RID<T> {
+        let raw = ((gen as u64) << 32) | ((type_tag as u64) << 16) | (slot as u64);
+        RID { raw }
+    }
+
+    fn slot(self)     -> u16 { (self.raw & 0xFFFF) as u16 }
+    fn type_tag(self) -> u16 { ((self.raw >> 16) & 0xFFFF) as u16 }
+    fn gen(self)      -> u32 { (self.raw >> 32) as u32 }
+}
+
+// ─── Rc<T> ─────────────────────────────────────────────────────────────────
+//
+// Single-threaded reference-counted pointer.
+// For shared GPU resources use Arc<T> from bm::sync.
+
+pub struct RcInner<T> {
+    count: u32,
+    value: T,
+}
+
+pub struct Rc<T> {
+    ptr: *var RcInner<T>,
+}
+
+impl<T> Rc<T> {
+    pub fn new(value: T) -> Rc<T> {
+        let inner = unsafe { bm::alloc::<RcInner<T>>() };
+        unsafe { *inner = RcInner { count: 1, value }; }
+        Rc { ptr: inner }
+    }
+
+    pub fn clone(self: &Rc<T>) -> Rc<T> {
+        unsafe { (*self.ptr).count += 1; }
+        Rc { ptr: self.ptr }
+    }
+
+    pub fn get(self: &Rc<T>) -> &T {
+        unsafe { &(*self.ptr).value }
+    }
+
+    pub fn get_mut(self: &var Rc<T>) -> &var T {
+        unsafe { &var (*self.ptr).value }
+    }
+
+    pub fn ref_count(self: &Rc<T>) -> u32 {
+        unsafe { (*self.ptr).count }
+    }
+}
+
+impl<T> Rc<T> {
+    /// Release one reference. Frees inner allocation when count reaches 0.
+    pub fn release(self: &var Rc<T>) {
+        unsafe {
+            (*self.ptr).count -= 1;
+            if (*self.ptr).count == 0 {
+                bm::free(self.ptr);
+            }
+        }
+    }
+}
+
+// ─── Resource trait ────────────────────────────────────────────────────────
+
+pub trait Resource {
+    /// Human-readable type name, e.g. "Texture2D", "AudioStream".
+    fn type_name(self: &Self) -> str;
+
+    /// File path this resource was loaded from (empty if procedural).
+    fn path(self: &Self) -> str;
+
+    /// Estimated GPU/memory footprint in bytes.
+    fn memory_bytes(self: &Self) -> usize { 0 }
+
+    /// Called when the resource is first loaded.
+    fn on_loaded(self: &var Self) {}
+
+    /// Called just before the resource is freed.
+    fn on_unload(self: &var Self) {}
+}
+
+// ─── Built-in resource types ───────────────────────────────────────────────
+
+pub struct Texture2D {
+    pub width:    u32,
+    pub height:   u32,
+    pub format:   TexFormat,
+    pub pixels:   *var u8,   // RGBA8 row-major
+    _path: str,
+}
+
+pub enum TexFormat { Rgba8, Rgb8, R8, Rgba16F, Rgba32F }
+
+impl Resource for Texture2D {
+    fn type_name(self: &Texture2D) -> str { "Texture2D" }
+    fn path(self: &Texture2D) -> str { self._path }
+    fn memory_bytes(self: &Texture2D) -> usize {
+        let bpp: usize = match self.format {
+            TexFormat::Rgba8  => 4,
+            TexFormat::Rgb8   => 3,
+            TexFormat::R8     => 1,
+            TexFormat::Rgba16F => 8,
+            TexFormat::Rgba32F => 16,
+        };
+        self.width as usize * self.height as usize * bpp
+    }
+}
+
+pub struct AudioStream {
+    pub sample_rate: u32,
+    pub channels:    u8,
+    pub samples:     *var i16,
+    pub sample_count: usize,
+    _path: str,
+}
+
+impl Resource for AudioStream {
+    fn type_name(self: &AudioStream) -> str { "AudioStream" }
+    fn path(self: &AudioStream) -> str { self._path }
+    fn memory_bytes(self: &AudioStream) -> usize {
+        self.sample_count * 2 * self.channels as usize
+    }
+}
+
+pub struct Mesh {
+    pub vertices:  *var f32,    // packed [x,y,z, nx,ny,nz, u,v] per vertex
+    pub vert_count: usize,
+    pub indices:   *var u32,
+    pub idx_count:  usize,
+    _path: str,
+}
+
+impl Resource for Mesh {
+    fn type_name(self: &Mesh) -> str { "Mesh" }
+    fn path(self: &Mesh) -> str { self._path }
+    fn memory_bytes(self: &Mesh) -> usize {
+        self.vert_count * 32 + self.idx_count * 4
+    }
+}
+
+// ─── ResourceCache ─────────────────────────────────────────────────────────
+
+pub struct CacheEntry {
+    ptr:      *var (),     // type-erased resource pointer
+    ref_count: u32,
+    type_tag:  u16,
+}
+
+pub struct ResourceCache {
+    entries: HashMap<str, CacheEntry>,
+    total_bytes: usize,
+}
+
+impl ResourceCache {
+    pub fn new() -> ResourceCache {
+        ResourceCache {
+            entries:     HashMap::new(),
+            total_bytes: 0,
+        }
+    }
+
+    pub fn contains(self: &ResourceCache, path: str) -> bool {
+        self.entries.contains_key(path)
+    }
+
+    pub fn incref(self: &var ResourceCache, path: str) {
+        match self.entries.get_mut(path) {
+            Some(e) => { e.ref_count += 1; }
+            None => {}
+        }
+    }
+
+    pub fn decref(self: &var ResourceCache, path: str) -> bool {
+        match self.entries.get_mut(path) {
+            Some(e) => {
+                if e.ref_count > 0 { e.ref_count -= 1; }
+                return e.ref_count == 0;
+            }
+            None => {}
+        }
+        false
+    }
+
+    pub fn memory_used(self: &ResourceCache) -> usize {
+        self.total_bytes
+    }
+
+    pub fn stats(self: &ResourceCache) -> CacheStats {
+        CacheStats {
+            count:       self.entries.len(),
+            total_bytes: self.total_bytes,
+        }
+    }
+}
+
+pub struct CacheStats {
+    pub count:       usize,
+    pub total_bytes: usize,
+}
+
+// ─── ResourceLoader ────────────────────────────────────────────────────────
+
+pub struct LoadRequest {
+    pub path:       str,
+    pub type_hint:  str,
+    pub use_cache:  bool,
+    pub priority:   LoadPriority,
+}
+
+pub enum LoadPriority { Background, Normal, High }
+
+pub struct ResourceLoader {
+    cache: ResourceCache,
+}
+
+impl ResourceLoader {
+    pub fn new() -> ResourceLoader {
+        ResourceLoader { cache: ResourceCache::new() }
+    }
+
+    /// Synchronous load — blocks until complete.
+    pub fn load(self: &var ResourceLoader, path: str) -> LoadResult {
+        if self.cache.contains(path) {
+            self.cache.incref(path);
+            return LoadResult::Cached;
+        }
+        // Dispatch to platform FS (platform/web.bm or platform/native.bm)
+        let bytes = unsafe { bm::platform::fs_read(path) };
+        if bytes == null {
+            return LoadResult::NotFound;
+        }
+        LoadResult::Ok
+    }
+
+    pub fn cache_stats(self: &ResourceLoader) -> CacheStats {
+        self.cache.stats()
+    }
+}
+
+pub enum LoadResult { Ok, Cached, NotFound, ParseError, IoError }

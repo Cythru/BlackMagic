@@ -1,0 +1,298 @@
+/// BlackMagic Engine — ai/sampler.bm
+///
+/// Token sampling strategies for LLM decode:
+///   greedy, temperature, top-k, top-p (nucleus), min-p.
+/// Repetition penalty modifies logits in-place before sampling.
+///
+/// SamplingParams bundles all parameters; `sample(logits, params)` dispatches.
+
+use engine::ai::ops::{ softmax_f32 };
+use bm::mem::{ alloc_slice, free_slice };
+
+// ─── SamplingParams ───────────────────────────────────────────────────────────
+
+pub struct SamplingParams {
+    pub temperature: f32,
+    pub top_k:       u32,
+    pub top_p:       f32,
+    pub min_p:       f32,
+    pub rep_penalty: f32,    // 1.0 = no penalty; > 1.0 = reduce repeats
+    pub max_tokens:  u32,
+}
+
+impl SamplingParams {
+    pub fn greedy() -> SamplingParams {
+        SamplingParams {
+            temperature: 0.0,
+            top_k:       1,
+            top_p:       1.0,
+            min_p:       0.0,
+            rep_penalty: 1.0,
+            max_tokens:  512,
+        }
+    }
+
+    pub fn default_chat() -> SamplingParams {
+        SamplingParams {
+            temperature: 0.7,
+            top_k:       40,
+            top_p:       0.9,
+            min_p:       0.05,
+            rep_penalty: 1.1,
+            max_tokens:  512,
+        }
+    }
+}
+
+// ─── Greedy ───────────────────────────────────────────────────────────────────
+
+pub fn sample_greedy(logits: *f32, vocab_size: usize) -> u32 {
+    var best_id:  u32  = 0;
+    var best_val: f32  = unsafe { *logits };
+    var i: usize = 1;
+    while i < vocab_size {
+        let v = unsafe { *logits.add(i) };
+        if v > best_val { best_val = v; best_id = i as u32; }
+        i += 1;
+    }
+    best_id
+}
+
+// ─── Temperature + softmax ────────────────────────────────────────────────────
+
+fn apply_temperature(logits: *var f32, vocab_size: usize, temp: f32) {
+    if temp <= 0.0 { return; }
+    let inv = 1.0 / temp;
+    var i: usize = 0;
+    while i < vocab_size {
+        unsafe { *logits.add(i) = *logits.add(i) * inv; }
+        i += 1;
+    }
+    softmax_f32(logits, vocab_size);
+}
+
+pub fn sample_temperature(logits: *var f32, vocab_size: usize, temp: f32) -> u32 {
+    if temp <= 0.0 { return sample_greedy(logits as *f32, vocab_size); }
+    apply_temperature(logits, vocab_size, temp);
+    sample_from_probs(logits as *f32, vocab_size)
+}
+
+// ─── Top-K ────────────────────────────────────────────────────────────────────
+
+pub fn sample_top_k(logits: *var f32, vocab_size: usize, k: u32, temp: f32) -> u32 {
+    if k <= 1 { return sample_greedy(logits as *f32, vocab_size); }
+
+    apply_temperature(logits, vocab_size, temp);
+    let kk = if k as usize > vocab_size { vocab_size } else { k as usize };
+
+    // Partial sort: find k-th largest probability (simple selection).
+    let indices: *var u32 = unsafe { alloc_slice::<u32>(vocab_size) };
+    var i: usize = 0;
+    while i < vocab_size { unsafe { *indices.add(i) = i as u32; } i += 1; }
+
+    // Partial insertion sort to get top-k in front
+    var j: usize = 0;
+    while j < kk {
+        var best = j;
+        var m = j + 1;
+        while m < vocab_size {
+            let bv = unsafe { *logits.add(*indices.add(best) as usize) };
+            let mv = unsafe { *logits.add(*indices.add(m) as usize) };
+            if mv > bv { best = m; }
+            m += 1;
+        }
+        if best != j {
+            let tmp = unsafe { *indices.add(j) };
+            unsafe { *indices.add(j) = *indices.add(best); }
+            unsafe { *indices.add(best) = tmp; }
+        }
+        j += 1;
+    }
+
+    // Zero out non-top-k, renormalise
+    var s: usize = kk;
+    while s < vocab_size {
+        unsafe { *logits.add(*indices.add(s) as usize) = 0.0; }
+        s += 1;
+    }
+
+    // Renormalise top-k slice
+    var sum: f32 = 0.0;
+    var t: usize = 0;
+    while t < kk { sum = sum + unsafe { *logits.add(*indices.add(t) as usize) }; t += 1; }
+    let inv_sum = if sum > 0.0 { 1.0 / sum } else { 1.0 };
+    var u: usize = 0;
+    while u < kk {
+        let id = unsafe { *indices.add(u) as usize };
+        unsafe { *logits.add(id) = *logits.add(id) * inv_sum; }
+        u += 1;
+    }
+
+    let result = sample_from_probs(logits as *f32, vocab_size);
+    unsafe { free_slice::<u32>(indices, vocab_size); }
+    result
+}
+
+// ─── Top-P (nucleus) ─────────────────────────────────────────────────────────
+
+pub fn sample_top_p(logits: *var f32, vocab_size: usize, p: f32, temp: f32) -> u32 {
+    apply_temperature(logits, vocab_size, temp);
+
+    // Sort indices descending by probability
+    let indices: *var u32 = unsafe { alloc_slice::<u32>(vocab_size) };
+    var i: usize = 0;
+    while i < vocab_size { unsafe { *indices.add(i) = i as u32; } i += 1; }
+    sort_desc_by_prob(indices, logits as *f32, vocab_size);
+
+    // Accumulate until cumulative prob ≥ p
+    var cum: f32 = 0.0;
+    var cutoff: usize = 0;
+    var j: usize = 0;
+    while j < vocab_size {
+        cum = cum + unsafe { *logits.add(*indices.add(j) as usize) };
+        cutoff = j + 1;
+        if cum >= p { break; }
+        j += 1;
+    }
+
+    // Zero everything after cutoff
+    var k: usize = cutoff;
+    while k < vocab_size {
+        unsafe { *logits.add(*indices.add(k) as usize) = 0.0; }
+        k += 1;
+    }
+
+    // Renormalise
+    var sum: f32 = 0.0;
+    var m: usize = 0;
+    while m < cutoff { sum = sum + unsafe { *logits.add(*indices.add(m) as usize) }; m += 1; }
+    let inv = if sum > 0.0 { 1.0 / sum } else { 1.0 };
+    var n: usize = 0;
+    while n < cutoff {
+        let id = unsafe { *indices.add(n) as usize };
+        unsafe { *logits.add(id) = *logits.add(id) * inv; }
+        n += 1;
+    }
+
+    let result = sample_from_probs(logits as *f32, vocab_size);
+    unsafe { free_slice::<u32>(indices, vocab_size); }
+    result
+}
+
+// ─── Min-P ────────────────────────────────────────────────────────────────────
+
+/// min-p: discard tokens whose probability < min_p * p_max.
+pub fn sample_min_p(logits: *var f32, vocab_size: usize, min_p: f32, temp: f32) -> u32 {
+    apply_temperature(logits, vocab_size, temp);
+    var p_max: f32 = 0.0;
+    var i: usize = 0;
+    while i < vocab_size {
+        let v = unsafe { *logits.add(i) };
+        if v > p_max { p_max = v; }
+        i += 1;
+    }
+    let threshold = min_p * p_max;
+    var j: usize = 0;
+    while j < vocab_size {
+        if unsafe { *logits.add(j) } < threshold {
+            unsafe { *logits.add(j) = 0.0; }
+        }
+        j += 1;
+    }
+    // Renormalise
+    var sum: f32 = 0.0;
+    var k: usize = 0;
+    while k < vocab_size { sum = sum + unsafe { *logits.add(k) }; k += 1; }
+    let inv = if sum > 0.0 { 1.0 / sum } else { 1.0 };
+    var m: usize = 0;
+    while m < vocab_size {
+        unsafe { *logits.add(m) = *logits.add(m) * inv; }
+        m += 1;
+    }
+    sample_from_probs(logits as *f32, vocab_size)
+}
+
+// ─── Repetition penalty ───────────────────────────────────────────────────────
+
+/// Reduce probabilities of previously generated tokens.
+/// penalty > 1.0: divide logits of seen tokens by penalty.
+pub fn apply_rep_penalty(logits: *var f32, token_ids: *u32, n: usize, penalty: f32) {
+    if penalty <= 1.0 { return; }
+    var i: usize = 0;
+    while i < n {
+        let id = unsafe { *token_ids.add(i) as usize };
+        let v = unsafe { *logits.add(id) };
+        unsafe { *logits.add(id) = if v >= 0.0 { v / penalty } else { v * penalty }; }
+        i += 1;
+    }
+}
+
+// ─── Dispatch ────────────────────────────────────────────────────────────────
+
+/// Apply repetition penalty then sample using the given params.
+/// Mutates logits in-place.
+pub fn sample(logits: *var f32, vocab_size: usize, token_ids: *u32, n_prev: usize, params: &SamplingParams) -> u32 {
+    apply_rep_penalty(logits, token_ids, n_prev, params.rep_penalty);
+
+    if params.temperature <= 0.0 {
+        return sample_greedy(logits as *f32, vocab_size);
+    }
+    if params.top_k == 1 {
+        return sample_greedy(logits as *f32, vocab_size);
+    }
+    if params.min_p > 0.0 {
+        return sample_min_p(logits, vocab_size, params.min_p, params.temperature);
+    }
+    if params.top_p < 1.0 {
+        return sample_top_p(logits, vocab_size, params.top_p, params.temperature);
+    }
+    if params.top_k > 0 {
+        return sample_top_k(logits, vocab_size, params.top_k, params.temperature);
+    }
+    sample_temperature(logits, vocab_size, params.temperature)
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Sample from a probability distribution (multinomial).
+/// Uses LCG pseudo-random; sufficient for inference diversity.
+fn sample_from_probs(probs: *f32, vocab_size: usize) -> u32 {
+    let rand = lcg_next();
+    let r = rand as f32 / 4294967295.0;  // [0, 1)
+    var cum: f32 = 0.0;
+    var i: usize = 0;
+    while i < vocab_size {
+        cum = cum + unsafe { *probs.add(i) };
+        if r < cum { return i as u32; }
+        i += 1;
+    }
+    (vocab_size - 1) as u32
+}
+
+fn sort_desc_by_prob(indices: *var u32, probs: *f32, n: usize) {
+    // Insertion sort descending — fine for vocab sizes after top-k trim
+    var i: usize = 1;
+    while i < n {
+        let key = unsafe { *indices.add(i) };
+        let key_prob = unsafe { *probs.add(key as usize) };
+        var j = i;
+        while j > 0 && unsafe { *probs.add(*indices.add(j - 1) as usize) } < key_prob {
+            unsafe { *indices.add(j) = *indices.add(j - 1); }
+            j -= 1;
+        }
+        unsafe { *indices.add(j) = key; }
+        i += 1;
+    }
+}
+
+// Simple LCG for sampling randomness (seeded at startup or per-request).
+var _lcg_state: u64 = 6364136223846793005;
+
+fn lcg_next() -> u32 {
+    _lcg_state = _lcg_state * 6364136223846793005 + 1442695040888963407;
+    ((_lcg_state >> 33) ^ (_lcg_state >> 17)) as u32
+}
+
+pub fn sampler_seed(seed: u64) {
+    _lcg_state = if seed != 0 { seed } else { 6364136223846793005 };
+}

@@ -1,0 +1,187 @@
+/// BlackMagic Engine — ai/tensor.bm
+///
+/// Core tensor type: dense n-dimensional array with dtype tagging.
+/// Tensors may live in CPU heap memory or GPU DMA-pinned physical memory.
+///
+/// GPU tensors: `data` holds a physical address obtained from
+/// apex_alloc_tensor (via engine::platform::apex). `on_gpu()` returns
+/// true for these; matmul dispatch routes them through Vulkan compute.
+///
+/// Supported dtypes:
+///   F32, F16, Bf16 — floating point
+///   I8             — signed integer (quantized intermediate)
+///   Q8_0           — 8-bit block-quantized (32-elem blocks)
+///   Q4_K           — 4-bit K-quantized (GGUF Q4_K_M)
+
+use bm::mem::{ alloc_slice, free_slice };
+
+// ─── Dtype ───────────────────────────────────────────────────────────────────
+
+pub enum Dtype {
+    F32,
+    F16,
+    Bf16,
+    I8,
+    Q8_0,
+    Q4_K,
+}
+
+/// Returns the size in bytes of a single element (or block) for each dtype.
+/// For quantized formats, this is the per-element byte cost (fractional = scaled).
+/// Q8_0: 1 byte/elem + 4-byte scale per 32 elems → approx 1 byte rounded up.
+/// Q4_K: 0.5 bytes/elem (4 bits); we return 1 here and callers halve for buf sizing.
+pub fn elem_size(dtype: Dtype) -> usize {
+    match dtype {
+        Dtype::F32  => 4,
+        Dtype::F16  => 2,
+        Dtype::Bf16 => 2,
+        Dtype::I8   => 1,
+        Dtype::Q8_0 => 1,   // 32-elem block = 32 bytes + 4-byte scale → rounded
+        Dtype::Q4_K => 1,   // 32-elem block = 16 bytes + overhead; caller handles
+    }
+}
+
+/// Number of elements given shape and ndim.
+pub fn numel(shape: *u32, ndim: u8) -> usize {
+    var n: usize = 1;
+    var i: u8 = 0;
+    while i < ndim {
+        n = n * unsafe { *shape.add(i as usize) } as usize;
+        i += 1;
+    }
+    n
+}
+
+/// Byte count for a tensor with given shape/ndim/dtype.
+/// Q4_K: rounds up to nearest 2 elems (4-bit packing).
+pub fn byte_count(shape: *u32, ndim: u8, dtype: Dtype) -> usize {
+    let ne = numel(shape, ndim);
+    match dtype {
+        Dtype::Q4_K => (ne + 1) / 2,   // 2 elems per byte, round up
+        Dtype::Q8_0 => {
+            // 32-elem block: 32 bytes data + 4 bytes scale
+            let blocks = (ne + 31) / 32;
+            ne + blocks * 4
+        }
+        _ => ne * elem_size(dtype),
+    }
+}
+
+// ─── Tensor ───────────────────────────────────────────────────────────────────
+
+/// Dense n-dimensional tensor.
+///
+/// `shape[0..ndim]` holds dimension sizes; up to 8 dims supported.
+/// `data` points to either CPU heap or GPU DMA-pinned physical memory.
+/// GPU tensors: `data` value is a raw physical address (u64 cast to *u8);
+/// do NOT dereference on CPU — route through apex_matmul_gpu intrinsic.
+pub struct Tensor {
+    pub shape:   [u32; 8],
+    pub ndim:    u8,
+    pub dtype:   Dtype,
+    pub data:    *var u8,
+    pub n_bytes: usize,
+    _gpu:        bool,    // true if data is a DMA physical address
+}
+
+impl Tensor {
+    /// Allocate a CPU tensor with the given shape and dtype.
+    pub fn alloc(shape: *u32, ndim: u8, dtype: Dtype) -> Tensor {
+        let nb = byte_count(shape, ndim, dtype);
+        let ptr = unsafe { alloc_slice::<u8>(nb) };
+        var t = Tensor {
+            shape:   [0u32; 8],
+            ndim,
+            dtype,
+            data:    ptr,
+            n_bytes: nb,
+            _gpu:    false,
+        };
+        var i: u8 = 0;
+        while i < ndim {
+            t.shape[i as usize] = unsafe { *shape.add(i as usize) };
+            i += 1;
+        }
+        t
+    }
+
+    /// Free a CPU-allocated tensor. Do NOT call on GPU tensors — use
+    /// apex_free_tensor for those.
+    pub fn free(self: &var Tensor) {
+        if !self._gpu {
+            unsafe { free_slice::<u8>(self.data, self.n_bytes); }
+        }
+        self.data    = 0 as *var u8;
+        self.n_bytes = 0;
+    }
+
+    /// Returns true if this tensor is backed by GPU DMA memory.
+    pub fn on_gpu(self: &Tensor) -> bool { self._gpu }
+
+    /// Number of elements.
+    pub fn numel(self: &Tensor) -> usize {
+        numel(&self.shape as *u32, self.ndim)
+    }
+
+    /// Reshape in-place. Total element count must match.
+    pub fn reshape(self: &var Tensor, new_shape: *u32, new_ndim: u8) {
+        let new_ne = numel(new_shape, new_ndim);
+        // Caller is responsible for ensuring numel equality.
+        self.ndim = new_ndim;
+        var i: u8 = 0;
+        while i < new_ndim {
+            self.shape[i as usize] = unsafe { *new_shape.add(i as usize) };
+            i += 1;
+        }
+        // n_bytes and data unchanged — layout is flat row-major
+        _ = new_ne;
+    }
+
+    /// Return a view (slice along dim 0). Does not allocate — shares data.
+    /// `start` and `end` are indices along dim 0 (exclusive end).
+    pub fn slice(self: &Tensor, start: u32, end: u32) -> Tensor {
+        let row_elems = numel((&self.shape as *u32).add(1), self.ndim - 1);
+        let offset    = row_elems * start as usize * elem_size(self.dtype);
+        let slice_ne  = row_elems * (end - start) as usize;
+        var s = Tensor {
+            shape:   self.shape,
+            ndim:    self.ndim,
+            dtype:   self.dtype,
+            data:    unsafe { self.data.add(offset) },
+            n_bytes: slice_ne * elem_size(self.dtype),
+            _gpu:    self._gpu,
+        };
+        s.shape[0] = end - start;
+        s
+    }
+
+    /// Wrap a GPU DMA handle (physical address) as a Tensor.
+    /// `phys_addr` comes from apex_get_phys / apex_alloc_tensor.
+    pub fn from_gpu(phys_addr: u64, shape: *u32, ndim: u8, dtype: Dtype) -> Tensor {
+        let nb = byte_count(shape, ndim, dtype);
+        var t = Tensor {
+            shape:   [0u32; 8],
+            ndim,
+            dtype,
+            data:    phys_addr as *var u8,
+            n_bytes: nb,
+            _gpu:    true,
+        };
+        var i: u8 = 0;
+        while i < ndim {
+            t.shape[i as usize] = unsafe { *shape.add(i as usize) };
+            i += 1;
+        }
+        t
+    }
+
+    /// Return a const pointer to the raw data bytes (CPU only).
+    pub fn as_f32(self: &Tensor) -> *f32 {
+        self.data as *f32
+    }
+
+    /// Return a mutable pointer to the raw data bytes (CPU only).
+    pub fn as_f32_mut(self: &var Tensor) -> *var f32 {
+        self.data as *var f32
+    }
+}

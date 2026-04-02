@@ -1,0 +1,273 @@
+/// BlackMagic Engine — scene/node.bm
+///
+/// Base Node type — the fundamental unit of the scene tree.
+/// Everything in the engine is a Node (or derives from one).
+///
+/// Godot Node contract reproduced in BlackMagic:
+///   - Each node has a name, an optional parent, and an ordered child list
+///   - Lifecycle: _ready → _process/_physics_process → _exit_tree
+///   - Groups: nodes can join named groups; SceneTree broadcasts to groups
+///   - Signals: entered_tree, exited_tree, child_entered, child_exited, renamed
+///   - NodePath: "/" delimited path ("World/Player/Camera")
+
+use engine::core::signal::{ Signal, SigEnterTree, SigExitTree, SigProcess, SigPhysTick };
+use bm::collections::{ Vec as BmVec, HashMap };
+
+// ─── Default no-op callbacks ───────────────────────────────────────────────
+// BM has no closures; use static stubs as default fn pointer values.
+
+fn node_nop(_n: *var Node) {}
+fn node_nop_dt(_n: *var Node, _dt: f32) {}
+fn node_nop_notif(_n: *var Node, _code: u32) {}
+
+// ─── NodePath ──────────────────────────────────────────────────────────────
+
+pub struct NodePath {
+    segments: BmVec<str>,
+    absolute: bool,
+}
+
+impl NodePath {
+    pub fn from_str(s: str) -> NodePath {
+        let absolute = s.starts_with("/");
+        let trimmed  = if absolute { s[1..] } else { s };
+        let segments = trimmed.split("/").collect();
+        NodePath { segments, absolute }
+    }
+
+    pub fn root() -> NodePath {
+        NodePath { segments: BmVec::new(), absolute: true }
+    }
+
+    pub fn is_empty(self: &NodePath) -> bool { self.segments.is_empty() }
+
+    pub fn depth(self: &NodePath) -> usize { self.segments.len() }
+
+    pub fn parent_path(self: &NodePath) -> NodePath {
+        var segs = self.segments.clone();
+        if !segs.is_empty() { segs.pop(); }
+        NodePath { segments: segs, absolute: self.absolute }
+    }
+
+    pub fn child(self: &NodePath, name: str) -> NodePath {
+        var segs = self.segments.clone();
+        segs.push(name);
+        NodePath { segments: segs, absolute: self.absolute }
+    }
+}
+
+// ─── ProcessMode ───────────────────────────────────────────────────────────
+
+pub enum ProcessMode {
+    /// Inherits parent's mode (default).
+    Inherit,
+    /// Always processes, even when paused.
+    Always,
+    /// Processes only when not paused.
+    Pausable,
+    /// Processes only when paused.
+    WhenPaused,
+    /// Never processes.
+    Disabled,
+}
+
+// ─── NodeFlags ─────────────────────────────────────────────────────────────
+
+pub const FLAG_IN_TREE:    u32 = 1 << 0;
+pub const FLAG_READY_DONE: u32 = 1 << 1;
+pub const FLAG_VISIBLE:    u32 = 1 << 2;
+pub const FLAG_PAUSED:     u32 = 1 << 3;
+
+// ─── Node ──────────────────────────────────────────────────────────────────
+
+pub struct Node {
+    // Identity
+    pub name:   str,
+    pub flags:  u32,
+    pub groups: BmVec<str>,
+
+    // Tree structure
+    pub parent:   *var Node,
+    pub children: BmVec<*var Node>,
+
+    // Lifecycle callbacks (fn pointers allow per-instance override without vtable)
+    pub on_ready:          fn(*var Node),
+    pub on_process:        fn(*var Node, f32),
+    pub on_physics_process: fn(*var Node, f32),
+    pub on_enter_tree:     fn(*var Node),
+    pub on_exit_tree:      fn(*var Node),
+    pub on_notification:   fn(*var Node, u32),
+
+    // Built-in signals
+    pub sig_entered_tree:  Signal<SigEnterTree>,
+    pub sig_exited_tree:   Signal<SigExitTree>,
+    pub sig_process:       Signal<SigProcess>,
+    pub sig_phys_tick:     Signal<SigPhysTick>,
+
+    // Process mode
+    pub process_mode: ProcessMode,
+
+    // Owner (for scene instancing — points to root of the loaded scene)
+    pub owner: *var Node,
+}
+
+impl Node {
+    pub fn new(name: str) -> Node {
+        Node {
+            name,
+            flags:    FLAG_VISIBLE,
+            groups:   BmVec::new(),
+            parent:   null,
+            children: BmVec::new(),
+            on_ready:           node_nop,
+            on_process:         node_nop_dt,
+            on_physics_process: node_nop_dt,
+            on_enter_tree:      node_nop,
+            on_exit_tree:       node_nop,
+            on_notification:    node_nop_notif,
+            sig_entered_tree: Signal::new(),
+            sig_exited_tree:  Signal::new(),
+            sig_process:      Signal::new(),
+            sig_phys_tick:    Signal::new(),
+            process_mode: ProcessMode::Inherit,
+            owner:        null,
+        }
+    }
+
+    // ── Tree ──────────────────────────────────────────────────────────────
+
+    pub fn add_child(self: &var Node, child: *var Node) {
+        unsafe {
+            (*child).parent = self as *var Node;
+            self.children.push(child);
+            if self.is_in_tree() {
+                Node::enter_tree_recursive(child);
+            }
+        }
+    }
+
+    pub fn remove_child(self: &var Node, child: *var Node) {
+        var i: usize = 0;
+        while i < self.children.len() {
+            if self.children[i] == child {
+                self.children.swap_remove(i);
+                unsafe {
+                    (*child).parent = null;
+                    if self.is_in_tree() {
+                        Node::exit_tree_recursive(child);
+                    }
+                }
+                return;
+            }
+            i += 1;
+        }
+    }
+
+    pub fn get_child(self: &Node, idx: usize) -> *var Node {
+        if idx < self.children.len() { self.children[idx] } else { null }
+    }
+
+    pub fn child_count(self: &Node) -> usize { self.children.len() }
+
+    pub fn get_node(self: &Node, path: NodePath) -> *var Node {
+        if path.is_empty() { return self as *var Node; }
+        let first = path.segments[0];
+        // ".." = parent
+        if first == ".." {
+            if self.parent == null { return null; }
+            let rest = NodePath { segments: path.segments[1..].to_vec(), absolute: false };
+            return unsafe { (*self.parent).get_node(rest) };
+        }
+        var i: usize = 0;
+        while i < self.children.len() {
+            let child = self.children[i];
+            if unsafe { (*child).name == first } {
+                if path.depth() == 1 { return child; }
+                let rest = NodePath { segments: path.segments[1..].to_vec(), absolute: false };
+                return unsafe { (*child).get_node(rest) };
+            }
+            i += 1;
+        }
+        null
+    }
+
+    // ── Flags ─────────────────────────────────────────────────────────────
+
+    #[inline] pub fn is_in_tree(self: &Node)  -> bool { self.flags & FLAG_IN_TREE    != 0 }
+    #[inline] pub fn is_visible(self: &Node)  -> bool { self.flags & FLAG_VISIBLE    != 0 }
+    #[inline] pub fn is_paused(self: &Node)   -> bool { self.flags & FLAG_PAUSED     != 0 }
+
+    pub fn set_visible(self: &var Node, v: bool) {
+        if v { self.flags |= FLAG_VISIBLE; } else { self.flags &= !FLAG_VISIBLE; }
+        self.on_notification(self as *var Node, NOTIF_VISIBILITY_CHANGED);
+    }
+
+    // ── Groups ────────────────────────────────────────────────────────────
+
+    pub fn add_to_group(self: &var Node, group: str) {
+        if !self.is_in_group(group) { self.groups.push(group); }
+    }
+
+    pub fn remove_from_group(self: &var Node, group: str) {
+        var i: usize = 0;
+        while i < self.groups.len() {
+            if self.groups[i] == group { self.groups.swap_remove(i); return; }
+            i += 1;
+        }
+    }
+
+    pub fn is_in_group(self: &Node, group: str) -> bool {
+        var i: usize = 0;
+        while i < self.groups.len() {
+            if self.groups[i] == group { return true; }
+            i += 1;
+        }
+        false
+    }
+
+    // ── Internal lifecycle ─────────────────────────────────────────────────
+
+    fn enter_tree_recursive(n: *var Node) {
+        unsafe {
+            (*n).flags |= FLAG_IN_TREE;
+            ((*n).on_enter_tree)(n);
+            (*n).sig_entered_tree.emit(SigEnterTree {});
+            if (*n).flags & FLAG_READY_DONE == 0 {
+                ((*n).on_ready)(n);
+                (*n).flags |= FLAG_READY_DONE;
+            }
+            var i: usize = 0;
+            while i < (*n).children.len() {
+                Node::enter_tree_recursive((*n).children[i]);
+                i += 1;
+            }
+        }
+    }
+
+    fn exit_tree_recursive(n: *var Node) {
+        unsafe {
+            var i: usize = 0;
+            while i < (*n).children.len() {
+                Node::exit_tree_recursive((*n).children[i]);
+                i += 1;
+            }
+            ((*n).on_exit_tree)(n);
+            (*n).sig_exited_tree.emit(SigExitTree {});
+            (*n).flags &= !FLAG_IN_TREE;
+        }
+    }
+}
+
+// ─── Notification codes (Godot-compatible) ─────────────────────────────────
+
+pub const NOTIF_ENTER_TREE:          u32 = 10;
+pub const NOTIF_EXIT_TREE:           u32 = 11;
+pub const NOTIF_MOVED_IN_PARENT:     u32 = 12;
+pub const NOTIF_READY:               u32 = 13;
+pub const NOTIF_PAUSED:              u32 = 14;
+pub const NOTIF_UNPAUSED:            u32 = 15;
+pub const NOTIF_PHYSICS_PROCESS:     u32 = 16;
+pub const NOTIF_PROCESS:             u32 = 17;
+pub const NOTIF_VISIBILITY_CHANGED:  u32 = 31;
+pub const NOTIF_CHILD_ORDER_CHANGED: u32 = 33;
+pub const NOTIF_WM_CLOSE_REQUEST:    u32 = 1006;

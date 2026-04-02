@@ -1,0 +1,226 @@
+/// BlackMagic Engine — ai/kvcache.bm
+///
+/// Paged KV-cache for VLLM-style continuous batching.
+/// Memory is divided into fixed-size KV blocks (KV_BLOCK_TOKENS tokens each).
+/// Each block holds K and V tensors for all heads across KV_BLOCK_TOKENS positions.
+///
+/// Prefix sharing: find_prefix() locates the longest cached prefix so new
+/// requests can reuse previously computed KV blocks without re-running prefill.
+///
+/// Copy-on-write: when a cached block is shared (ref_count > 1), copy_on_write()
+/// allocates a private copy before mutation.
+
+use bm::mem::{ alloc_slice, free_slice };
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+pub const KV_BLOCK_TOKENS: u32 = 16;   // tokens per KV page
+pub const KV_NULL: u32 = 0xFFFFFFFF;   // invalid block index sentinel
+
+// ─── KvBlock ─────────────────────────────────────────────────────────────────
+
+/// One page of KV cache.
+/// k: [KV_BLOCK_TOKENS, n_kv_heads, head_dim] as f32 (flattened)
+/// v: [KV_BLOCK_TOKENS, n_kv_heads, head_dim] as f32 (flattened)
+pub struct KvBlock {
+    pub k:         *var f32,
+    pub v:         *var f32,
+    pub ref_count: u32,
+    pub token_ids: [u32; 16],   // the token IDs stored in this block
+    pub n_filled:  u32,         // how many of the 16 slots are written
+}
+
+// ─── BlockAllocator ──────────────────────────────────────────────────────────
+
+/// Pool of pre-allocated KV blocks.
+pub struct BlockAllocator {
+    pub blocks:    *var KvBlock,
+    pub free_list: *var u32,
+    pub n_total:   u32,
+    pub n_free:    u32,
+    kv_floats:     usize,   // floats per k or v array
+}
+
+impl BlockAllocator {
+    /// Initialise pool with `n_blocks` blocks.
+    /// `n_kv_heads` × `head_dim` = kv_dim; each block stores KV_BLOCK_TOKENS rows.
+    pub fn new(n_blocks: u32, kv_dim: usize) -> BlockAllocator {
+        let kv_floats = KV_BLOCK_TOKENS as usize * kv_dim;
+        let blocks = unsafe { alloc_slice::<KvBlock>(n_blocks as usize) };
+        let free_list = unsafe { alloc_slice::<u32>(n_blocks as usize) };
+
+        var i: u32 = 0;
+        while i < n_blocks {
+            let k_ptr = unsafe { alloc_slice::<f32>(kv_floats) };
+            let v_ptr = unsafe { alloc_slice::<f32>(kv_floats) };
+            let blk = KvBlock {
+                k: k_ptr,
+                v: v_ptr,
+                ref_count: 0,
+                token_ids: [0u32; 16],
+                n_filled: 0,
+            };
+            unsafe { *blocks.add(i as usize) = blk; }
+            unsafe { *free_list.add(i as usize) = i; }
+            i += 1;
+        }
+
+        BlockAllocator {
+            blocks,
+            free_list,
+            n_total: n_blocks,
+            n_free:  n_blocks,
+            kv_floats,
+        }
+    }
+
+    /// Allocate a block. Returns KV_NULL if pool is exhausted.
+    pub fn alloc(self: &var BlockAllocator) -> u32 {
+        if self.n_free == 0 { return KV_NULL; }
+        self.n_free -= 1;
+        let idx = unsafe { *self.free_list.add(self.n_free as usize) };
+        let blk = unsafe { &var *self.blocks.add(idx as usize) };
+        blk.ref_count = 1;
+        blk.n_filled  = 0;
+        idx
+    }
+
+    /// Decrement ref_count; free if it reaches 0.
+    pub fn free(self: &var BlockAllocator, idx: u32) {
+        if idx == KV_NULL { return; }
+        let blk = unsafe { &var *self.blocks.add(idx as usize) };
+        if blk.ref_count == 0 { return; }
+        blk.ref_count -= 1;
+        if blk.ref_count == 0 {
+            blk.n_filled = 0;
+            unsafe { *self.free_list.add(self.n_free as usize) = idx; }
+            self.n_free += 1;
+        }
+    }
+
+    /// Copy-on-write: if block is shared, allocate a private copy.
+    /// Returns the (possibly new) block index.
+    pub fn copy_on_write(self: &var BlockAllocator, src_idx: u32) -> u32 {
+        if src_idx == KV_NULL { return KV_NULL; }
+        let src = unsafe { &*self.blocks.add(src_idx as usize) };
+        if src.ref_count <= 1 { return src_idx; }  // already private
+
+        let dst_idx = self.alloc();
+        if dst_idx == KV_NULL { return KV_NULL; }   // out of memory
+
+        let dst = unsafe { &var *self.blocks.add(dst_idx as usize) };
+        let src2 = unsafe { &*self.blocks.add(src_idx as usize) };
+
+        // Copy k/v data
+        var f: usize = 0;
+        while f < self.kv_floats {
+            unsafe { *dst.k.add(f) = *src2.k.add(f); }
+            unsafe { *dst.v.add(f) = *src2.v.add(f); }
+            f += 1;
+        }
+        dst.n_filled  = src2.n_filled;
+        dst.token_ids = src2.token_ids;
+
+        // Release shared reference
+        let src_blk = unsafe { &var *self.blocks.add(src_idx as usize) };
+        src_blk.ref_count -= 1;
+
+        dst_idx
+    }
+
+    /// Get ref to block by index.
+    pub fn get(self: &BlockAllocator, idx: u32) -> &KvBlock {
+        unsafe { &*self.blocks.add(idx as usize) }
+    }
+
+    /// Get mutable ref to block by index.
+    pub fn get_mut(self: &var BlockAllocator, idx: u32) -> &var KvBlock {
+        unsafe { &var *self.blocks.add(idx as usize) }
+    }
+}
+
+// ─── BlockTable ───────────────────────────────────────────────────────────────
+
+/// Per-sequence mapping: logical block index → physical block index.
+pub struct BlockTable {
+    pub entries: *var u32,
+    pub len:     u32,
+    pub sz:      u32,
+}
+
+impl BlockTable {
+    pub fn new(max_blocks: u32) -> BlockTable {
+        let ptr = unsafe { alloc_slice::<u32>(max_blocks as usize) };
+        var i: u32 = 0;
+        while i < max_blocks {
+            unsafe { *ptr.add(i as usize) = KV_NULL; }
+            i += 1;
+        }
+        BlockTable { entries: ptr, len: 0, sz: max_blocks }
+    }
+
+    pub fn push(self: &var BlockTable, block_idx: u32) {
+        if self.len < self.sz {
+            unsafe { *self.entries.add(self.len as usize) = block_idx; }
+            self.len += 1;
+        }
+    }
+
+    pub fn get(self: &BlockTable, logical: u32) -> u32 {
+        if logical < self.len {
+            unsafe { *self.entries.add(logical as usize) }
+        } else {
+            KV_NULL
+        }
+    }
+
+    pub fn free_blocks(self: &var BlockTable, alloc: &var BlockAllocator) {
+        var i: u32 = 0;
+        while i < self.len {
+            let idx = unsafe { *self.entries.add(i as usize) };
+            alloc.free(idx);
+            i += 1;
+        }
+        self.len = 0;
+    }
+}
+
+// ─── Prefix matching ─────────────────────────────────────────────────────────
+
+/// Find longest matching cached prefix for `tokens[0..n]`.
+/// Returns the number of blocks that are already cached (0 if no match).
+/// Searches all non-free blocks for the best prefix match.
+pub fn find_prefix(alloc: &BlockAllocator, tokens: *u32, n: u32) -> u32 {
+    let n_blocks_needed = (n + KV_BLOCK_TOKENS - 1) / KV_BLOCK_TOKENS;
+    var best: u32 = 0;
+
+    // Scan all allocated blocks for matching prefixes
+    var b: u32 = 0;
+    while b < alloc.n_total {
+        let blk = alloc.get(b);
+        if blk.ref_count == 0 || blk.n_filled != KV_BLOCK_TOKENS {
+            b += 1;
+            continue;
+        }
+        // Check if this block matches the tokens at its logical position
+        // (simplified: check block 0 match, then proceed)
+        let matches = block_tokens_match(blk, tokens, 0);
+        if matches {
+            best = 1;
+            // Could extend to multi-block prefix matching here
+        }
+        b += 1;
+    }
+
+    if best > n_blocks_needed { n_blocks_needed } else { best }
+}
+
+fn block_tokens_match(blk: &KvBlock, tokens: *u32, offset: u32) -> bool {
+    var i: u32 = 0;
+    while i < blk.n_filled && i < KV_BLOCK_TOKENS {
+        let tok = unsafe { *tokens.add((offset * KV_BLOCK_TOKENS + i) as usize) };
+        if blk.token_ids[i as usize] != tok { return false; }
+        i += 1;
+    }
+    true
+}

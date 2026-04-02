@@ -1,0 +1,357 @@
+/// BlackMagic Engine — ai/attention.bm
+///
+/// Attention mechanisms: MHA, GQA (Llama 3), paged attention (VLLM),
+/// and a tiled flash attention kernel with O(seq_len) memory.
+///
+/// Auto-select: gqa_forward when kv_heads < q_heads; mha_forward otherwise.
+/// Paged attention operates on a BlockTable, reading KV from the cache pool.
+
+use engine::ai::tensor::{ Tensor };
+use engine::ai::kvcache::{ KvBlock, BlockTable, BlockAllocator, KV_BLOCK_TOKENS };
+use engine::ai::ops::{ softmax_f32, f32_sqrt_approx };
+use bm::mem::{ alloc_slice, free_slice };
+
+// ─── MHA ─────────────────────────────────────────────────────────────────────
+
+/// Standard multi-head attention.
+/// q: [seq_len, q_heads, head_dim]
+/// k: [seq_len, q_heads, head_dim]
+/// v: [seq_len, q_heads, head_dim]
+/// out: [seq_len, q_heads, head_dim]
+pub fn mha_forward(
+    q: *f32, k: *f32, v: *f32, out: *var f32,
+    heads: usize, head_dim: usize, seq_len: usize,
+) {
+    let scale = 1.0 / f32_sqrt_approx(head_dim as f32);
+    let scores_n = seq_len * seq_len;
+    let scores: *var f32 = unsafe { alloc_slice::<f32>(scores_n) };
+
+    var h: usize = 0;
+    while h < heads {
+        let q_h = unsafe { q.add(h * seq_len * head_dim) };
+        let k_h = unsafe { k.add(h * seq_len * head_dim) };
+        let v_h = unsafe { v.add(h * seq_len * head_dim) };
+        let o_h = unsafe { out.add(h * seq_len * head_dim) };
+
+        // scores[i,j] = Q[i] · K[j] * scale
+        var i: usize = 0;
+        while i < seq_len {
+            var j: usize = 0;
+            while j <= i {   // causal mask: only attend to positions ≤ i
+                var dot: f32 = 0.0;
+                var d: usize = 0;
+                while d < head_dim {
+                    dot = dot + unsafe { *q_h.add(i * head_dim + d) * *k_h.add(j * head_dim + d) };
+                    d += 1;
+                }
+                unsafe { *scores.add(i * seq_len + j) = dot * scale; }
+                j += 1;
+            }
+            // Fill future positions with -inf (causal mask)
+            var jj = i + 1;
+            while jj < seq_len {
+                unsafe { *scores.add(i * seq_len + jj) = -1.0e30; }
+                jj += 1;
+            }
+            // Softmax over row i
+            softmax_f32(unsafe { scores.add(i * seq_len) }, seq_len);
+            i += 1;
+        }
+
+        // out[i] = Σ_j scores[i,j] * V[j]
+        var oi: usize = 0;
+        while oi < seq_len {
+            var d: usize = 0;
+            while d < head_dim {
+                var acc: f32 = 0.0;
+                var j: usize = 0;
+                while j < seq_len {
+                    acc = acc + unsafe { *scores.add(oi * seq_len + j) * *v_h.add(j * head_dim + d) };
+                    j += 1;
+                }
+                unsafe { *o_h.add(oi * head_dim + d) = acc; }
+                d += 1;
+            }
+            oi += 1;
+        }
+        h += 1;
+    }
+    unsafe { free_slice::<f32>(scores, scores_n); }
+}
+
+// ─── GQA ─────────────────────────────────────────────────────────────────────
+
+/// Grouped-query attention (Llama 3, Mistral).
+/// q_heads is a multiple of kv_heads; each KV head is shared by (q_heads/kv_heads) Q heads.
+pub fn gqa_forward(
+    q: *f32, k: *f32, v: *f32, out: *var f32,
+    q_heads: usize, kv_heads: usize, head_dim: usize, seq_len: usize,
+) {
+    let group = q_heads / kv_heads;
+    let scale  = 1.0 / f32_sqrt_approx(head_dim as f32);
+    let scores_n = seq_len * seq_len;
+    let scores: *var f32 = unsafe { alloc_slice::<f32>(scores_n) };
+
+    var h: usize = 0;
+    while h < q_heads {
+        let kv_h = h / group;
+        let q_h = unsafe { q.add(h    * seq_len * head_dim) };
+        let k_h = unsafe { k.add(kv_h * seq_len * head_dim) };
+        let v_h = unsafe { v.add(kv_h * seq_len * head_dim) };
+        let o_h = unsafe { out.add(h * seq_len * head_dim) };
+
+        var i: usize = 0;
+        while i < seq_len {
+            var j: usize = 0;
+            while j <= i {
+                var dot: f32 = 0.0;
+                var d: usize = 0;
+                while d < head_dim {
+                    dot = dot + unsafe { *q_h.add(i * head_dim + d) * *k_h.add(j * head_dim + d) };
+                    d += 1;
+                }
+                unsafe { *scores.add(i * seq_len + j) = dot * scale; }
+                j += 1;
+            }
+            var jj = i + 1;
+            while jj < seq_len {
+                unsafe { *scores.add(i * seq_len + jj) = -1.0e30; }
+                jj += 1;
+            }
+            softmax_f32(unsafe { scores.add(i * seq_len) }, seq_len);
+            i += 1;
+        }
+
+        var oi: usize = 0;
+        while oi < seq_len {
+            var d: usize = 0;
+            while d < head_dim {
+                var acc: f32 = 0.0;
+                var j: usize = 0;
+                while j < seq_len {
+                    acc = acc + unsafe { *scores.add(oi * seq_len + j) * *v_h.add(j * head_dim + d) };
+                    j += 1;
+                }
+                unsafe { *o_h.add(oi * head_dim + d) = acc; }
+                d += 1;
+            }
+            oi += 1;
+        }
+        h += 1;
+    }
+    unsafe { free_slice::<f32>(scores, scores_n); }
+}
+
+// ─── Paged attention ─────────────────────────────────────────────────────────
+
+/// VLLM-style paged attention for a single query position.
+/// `q`: [q_heads, head_dim] — current query (single token decode step).
+/// `out`: [q_heads, head_dim] — output.
+/// Reads K/V from the block pool via block_table.
+pub fn paged_attn(
+    q: *f32,
+    pool: &BlockAllocator,
+    table: &BlockTable,
+    out: *var f32,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    ctx_len: usize,     // number of valid context tokens
+) {
+    let group = if kv_heads > 0 { q_heads / kv_heads } else { 1 };
+    let scale  = 1.0 / f32_sqrt_approx(head_dim as f32);
+    let n_blocks = (ctx_len + KV_BLOCK_TOKENS as usize - 1) / KV_BLOCK_TOKENS as usize;
+
+    let scores: *var f32 = unsafe { alloc_slice::<f32>(ctx_len) };
+
+    var h: usize = 0;
+    while h < q_heads {
+        let kv_h = h / group;
+        let q_h  = unsafe { q.add(h * head_dim) };
+        let o_h  = unsafe { out.add(h * head_dim) };
+
+        // Zero output
+        var d: usize = 0;
+        while d < head_dim { unsafe { *o_h.add(d) = 0.0; } d += 1; }
+
+        // Compute scores: Q · K for all context positions
+        var blk_idx: usize = 0;
+        while blk_idx < n_blocks {
+            let phys = table.get(blk_idx as u32);
+            if phys == 0xFFFFFFFF { blk_idx += 1; continue; }
+            let blk = pool.get(phys);
+            let tokens_in_blk = if (blk_idx + 1) * KV_BLOCK_TOKENS as usize <= ctx_len {
+                KV_BLOCK_TOKENS as usize
+            } else {
+                ctx_len - blk_idx * KV_BLOCK_TOKENS as usize
+            };
+            var t: usize = 0;
+            while t < tokens_in_blk {
+                let pos = blk_idx * KV_BLOCK_TOKENS as usize + t;
+                let k_ptr = unsafe { blk.k.add(t * kv_heads * head_dim + kv_h * head_dim) };
+                var dot: f32 = 0.0;
+                var dd: usize = 0;
+                while dd < head_dim {
+                    dot = dot + unsafe { *q_h.add(dd) * *k_ptr.add(dd) };
+                    dd += 1;
+                }
+                unsafe { *scores.add(pos) = dot * scale; }
+                t += 1;
+            }
+            blk_idx += 1;
+        }
+
+        // Softmax over all ctx positions
+        softmax_f32(scores, ctx_len);
+
+        // Weighted sum of V
+        var blk2: usize = 0;
+        while blk2 < n_blocks {
+            let phys = table.get(blk2 as u32);
+            if phys == 0xFFFFFFFF { blk2 += 1; continue; }
+            let blk = pool.get(phys);
+            let tokens_in_blk = if (blk2 + 1) * KV_BLOCK_TOKENS as usize <= ctx_len {
+                KV_BLOCK_TOKENS as usize
+            } else {
+                ctx_len - blk2 * KV_BLOCK_TOKENS as usize
+            };
+            var t: usize = 0;
+            while t < tokens_in_blk {
+                let pos = blk2 * KV_BLOCK_TOKENS as usize + t;
+                let w   = unsafe { *scores.add(pos) };
+                let v_ptr = unsafe { blk.v.add(t * kv_heads * head_dim + kv_h * head_dim) };
+                var dd: usize = 0;
+                while dd < head_dim {
+                    unsafe { *o_h.add(dd) = *o_h.add(dd) + w * *v_ptr.add(dd); }
+                    dd += 1;
+                }
+                t += 1;
+            }
+            blk2 += 1;
+        }
+        h += 1;
+    }
+    unsafe { free_slice::<f32>(scores, ctx_len); }
+}
+
+// ─── Flash attention ─────────────────────────────────────────────────────────
+
+/// Tiled flash attention — O(seq_len) memory, one pass over K/V.
+/// Tile size TILE_SIZE; suitable for long contexts where seq² is too large.
+/// Implements the "online softmax" algorithm.
+pub fn flash_attn(
+    q: *f32, k: *f32, v: *f32, out: *var f32,
+    heads: usize, head_dim: usize, seq_len: usize,
+) {
+    const TILE_SIZE: usize = 64;
+    let scale = 1.0 / f32_sqrt_approx(head_dim as f32);
+    let tile_scores: *var f32 = unsafe { alloc_slice::<f32>(TILE_SIZE) };
+    let acc:         *var f32 = unsafe { alloc_slice::<f32>(head_dim) };
+
+    var h: usize = 0;
+    while h < heads {
+        let q_h = unsafe { q.add(h * seq_len * head_dim) };
+        let k_h = unsafe { k.add(h * seq_len * head_dim) };
+        let v_h = unsafe { v.add(h * seq_len * head_dim) };
+        let o_h = unsafe { out.add(h * seq_len * head_dim) };
+
+        var i: usize = 0;
+        while i < seq_len {
+            // Online softmax state
+            var m: f32 = -1.0e30;
+            var l: f32 = 0.0;
+            // Zero accumulator
+            var d: usize = 0;
+            while d < head_dim { unsafe { *acc.add(d) = 0.0; } d += 1; }
+
+            var j: usize = 0;
+            while j <= i {
+                let tile_end = if j + TILE_SIZE <= i + 1 { j + TILE_SIZE } else { i + 1 };
+                let tile_n = tile_end - j;
+
+                // Compute scores for tile
+                var t: usize = 0;
+                while t < tile_n {
+                    var dot: f32 = 0.0;
+                    var dd: usize = 0;
+                    while dd < head_dim {
+                        dot = dot + unsafe { *q_h.add(i * head_dim + dd) * *k_h.add((j + t) * head_dim + dd) };
+                        dd += 1;
+                    }
+                    unsafe { *tile_scores.add(t) = dot * scale; }
+                    t += 1;
+                }
+
+                // Update online softmax: new_m = max(m, max(tile))
+                var new_m = m;
+                var t2: usize = 0;
+                while t2 < tile_n {
+                    let s = unsafe { *tile_scores.add(t2) };
+                    if s > new_m { new_m = s; }
+                    t2 += 1;
+                }
+
+                // Rescale accumulator
+                let exp_shift = f32_exp_approx(m - new_m);
+                var dd: usize = 0;
+                while dd < head_dim {
+                    unsafe { *acc.add(dd) = *acc.add(dd) * exp_shift; }
+                    dd += 1;
+                }
+                l = l * exp_shift;
+
+                // Accumulate tile
+                var t3: usize = 0;
+                while t3 < tile_n {
+                    let e = f32_exp_approx(unsafe { *tile_scores.add(t3) } - new_m);
+                    l = l + e;
+                    var dd2: usize = 0;
+                    while dd2 < head_dim {
+                        unsafe { *acc.add(dd2) = *acc.add(dd2) + e * *v_h.add((j + t3) * head_dim + dd2); }
+                        dd2 += 1;
+                    }
+                    t3 += 1;
+                }
+
+                m = new_m;
+                j += TILE_SIZE;
+            }
+
+            // Normalise
+            let inv_l = 1.0 / l;
+            var d2: usize = 0;
+            while d2 < head_dim {
+                unsafe { *o_h.add(i * head_dim + d2) = *acc.add(d2) * inv_l; }
+                d2 += 1;
+            }
+            i += 1;
+        }
+        h += 1;
+    }
+    unsafe { free_slice::<f32>(tile_scores, TILE_SIZE); }
+    unsafe { free_slice::<f32>(acc, head_dim); }
+}
+
+// ─── Auto-select entry point ─────────────────────────────────────────────────
+
+/// Run attention with auto-selection: flash (seq > 512), GQA, or MHA.
+pub fn attn_forward(
+    q: *f32, k: *f32, v: *f32, out: *var f32,
+    q_heads: usize, kv_heads: usize, head_dim: usize, seq_len: usize,
+) {
+    if seq_len > 512 {
+        flash_attn(q, k, v, out, q_heads, head_dim, seq_len);
+    } else if kv_heads < q_heads {
+        gqa_forward(q, k, v, out, q_heads, kv_heads, head_dim, seq_len);
+    } else {
+        mha_forward(q, k, v, out, q_heads, head_dim, seq_len);
+    }
+}
+
+// ─── Fast scalar intrinsics (reused internally) ───────────────────────────────
+
+#[intrinsic]
+fn f32_sqrt_approx(x: f32) -> f32;
+
+#[intrinsic]
+fn f32_exp_approx(x: f32) -> f32;

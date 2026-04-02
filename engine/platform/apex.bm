@@ -1,0 +1,125 @@
+/// BlackMagic Engine — platform/apex.bm
+///
+/// APEX kernel platform bridge for native (non-WASM) targets.
+/// All declarations are #[intrinsic] — the BM compiler lowers them to
+/// kernel ioctl calls via /dev/apex-ai when targeting `--target native`.
+///
+/// These are language-level intrinsics, not FFI. No C, no Rust in this file.
+///
+/// Ioctl codes mirror those in apex-kernel/kernel/src/ai/src/sglang.rs:
+///   SGLANG_ALLOC_TENSOR  = 0x53470001
+///   SGLANG_FREE_TENSOR   = 0x53470002
+///   SGLANG_GET_PHYS      = 0x53470003
+///   GPU Vulkan dispatch  = apex internal (no code needed here)
+
+// ─── Tensor memory (ioctl SGLANG_ALLOC/FREE/PHYS) ────────────────────────────
+
+/// Allocate a tensor in the kernel DMA pool.
+/// `shape`: pointer to u32 array of `ndim` elements.
+/// `dtype`: matches TensorDtype in Rust (0=F32, 1=F16, 2=BF16, 3=I8, 4=Q8_0, 5=Q4_K).
+/// Returns a 64-bit opaque handle (u64). Zero = allocation failed.
+#[intrinsic]
+pub fn apex_alloc_tensor(shape: *u32, ndim: u8, dtype: u8) -> u64;
+
+/// Free a previously allocated tensor handle.
+#[intrinsic]
+pub fn apex_free_tensor(hdl: u64);
+
+/// Retrieve the DMA-stable physical address for a tensor handle.
+/// The returned address can be passed directly to apex_matmul_gpu.
+#[intrinsic]
+pub fn apex_get_phys(hdl: u64) -> u64;
+
+// ─── GPU compute dispatch ────────────────────────────────────────────────────
+
+/// Dispatch a matmul through the Vulkan compute pipeline.
+/// a_phys, b_phys, c_phys: physical addresses from apex_get_phys.
+/// m, k, n: matrix dimensions (C = A[m×k] × B[k×n]).
+/// Blocks until the GPU compute shader completes.
+#[intrinsic]
+pub fn apex_matmul_gpu(a_phys: u64, b_phys: u64, c_phys: u64, m: u64, k: u64, n: u64);
+
+// ─── VFS mmap ─────────────────────────────────────────────────────────────────
+
+/// Map a file from the APEX virtual filesystem into the process address space.
+/// `path`: null-terminated UTF-8 path.
+/// `len_out`: written with the file size in bytes.
+/// Returns a pointer to the mapped region. Null on failure.
+/// The mapping is read-only; do not free — it lives for the module lifetime.
+#[intrinsic]
+pub fn apex_fs_mmap(path: *u8, len_out: *var usize) -> *u8;
+
+// ─── Kernel log ───────────────────────────────────────────────────────────────
+
+/// Write a log message to the APEX kernel ring buffer (dmesg equivalent).
+#[intrinsic]
+pub fn apex_log(msg: *u8, len: usize);
+
+// ─── High-resolution monotonic clock ─────────────────────────────────────────
+
+/// Returns nanoseconds since kernel boot (CLOCK_MONOTONIC equivalent).
+#[intrinsic]
+pub fn apex_clock_ns() -> u64;
+
+// ─── Agent registration (MultiAgent MODE) ────────────────────────────────────
+
+/// Register an AI agent with the kernel MultiAgent scheduler.
+/// `rank`: agent rank (1 = highest authority). `quota_mb`: memory budget.
+/// `priority`: scheduling priority (lower = more CPU time).
+/// Returns an agent ID. Zero = registration failed.
+#[intrinsic]
+pub fn apex_register_agent(rank: u32, quota_mb: u32, priority: u32) -> u64;
+
+/// Release an agent registration.
+#[intrinsic]
+pub fn apex_release_agent(agent_id: u64);
+
+// ─── ApexPlatform ─────────────────────────────────────────────────────────────
+
+/// Lifecycle wrapper for the APEX platform bridge.
+pub struct ApexPlatform {
+    pub initialized: bool,
+    pub agent_id:    u64,
+}
+
+impl ApexPlatform {
+    /// Initialise the APEX platform: register a default agent for this module.
+    pub fn init(rank: u32, quota_mb: u32) -> ApexPlatform {
+        let agent_id = unsafe { apex_register_agent(rank, quota_mb, 64) };
+        let msg = "apex-ai: BlackMagic engine initialised\n";
+        unsafe { apex_log(msg.as_ptr(), msg.len()); }
+        ApexPlatform { initialized: agent_id != 0, agent_id }
+    }
+
+    /// Log a message through the kernel ring buffer.
+    pub fn log(self: &ApexPlatform, msg: str) {
+        if self.initialized {
+            unsafe { apex_log(msg.as_ptr(), msg.len()); }
+        }
+    }
+
+    /// Current time in nanoseconds (kernel monotonic clock).
+    pub fn clock_ns(self: &ApexPlatform) -> u64 {
+        unsafe { apex_clock_ns() }
+    }
+
+    /// Allocate a GPU tensor. Returns handle (0 = failure).
+    pub fn alloc_tensor(self: &ApexPlatform, shape: *u32, ndim: u8, dtype: u8) -> u64 {
+        if !self.initialized { return 0; }
+        unsafe { apex_alloc_tensor(shape, ndim, dtype) }
+    }
+
+    /// Free a GPU tensor handle.
+    pub fn free_tensor(self: &ApexPlatform, tensor_hdl: u64) {
+        if tensor_hdl != 0 { unsafe { apex_free_tensor(tensor_hdl); } }
+    }
+
+    /// Shutdown: release agent registration.
+    pub fn shutdown(self: &var ApexPlatform) {
+        if self.initialized && self.agent_id != 0 {
+            unsafe { apex_release_agent(self.agent_id); }
+            self.agent_id = 0;
+        }
+        self.initialized = false;
+    }
+}

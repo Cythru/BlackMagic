@@ -1,0 +1,202 @@
+/// BlackMagic Engine — algo/spatial.bm
+///
+/// Spatial hash grid — 2D broad-phase object queries.
+///   O(1) amortised insert, O(k) query where k = hits in region
+///   Hash buckets use open-addressing linked chains (no realloc)
+///
+/// Architecture:
+///   SpatialGrid   — holds bucket array + flat entry pool
+///   QueryResult   — output buffer (reuse per frame to avoid alloc)
+///
+/// Usage:
+///   var grid = SpatialGrid::new(32.0, 10, 4096);   // 32-unit cells, 1024 buckets, 4096 max objects
+///   grid.insert(entity_id, x, y, half_w, half_h);
+///   var q = QueryResult::new(64);
+///   grid.query_rect(player_x, player_y, view_w, view_h, &var q);
+///   grid.clear();   // call once per frame before re-inserting
+
+use bm::mem::{ alloc_slice, free_slice };
+
+// ─── QueryResult ──────────────────────────────────────────────────────────────
+
+pub struct QueryResult {
+    pub ids: *var u32,
+    pub len: usize,
+    pool_n:     usize,
+}
+
+impl QueryResult {
+    pub fn new(pool_n: usize) -> QueryResult {
+        let ids = alloc_slice::<u32>(pool_n);
+        QueryResult { ids, len: 0, pool_n }
+    }
+    pub fn free(self: &var QueryResult)  { free_slice(self.ids, self.pool_n); }
+    pub fn clear(self: &var QueryResult) { self.len = 0; }
+
+    fn push(self: &var QueryResult, id: u32) {
+        if self.len < self.pool_n {
+            unsafe { *self.ids.add(self.len) = id; }
+            self.len += 1;
+        }
+    }
+}
+
+// ─── Internal entry ───────────────────────────────────────────────────────────
+
+struct Entry {
+    id:   u32,
+    x:    f32,
+    y:    f32,
+    hw:   f32,   // half-width  (for AABB overlap test)
+    hh:   f32,   // half-height
+    next: u32,   // intrusive linked list — 0xFFFFFFFF = end of chain
+}
+
+// ─── SpatialGrid ──────────────────────────────────────────────────────────────
+
+pub struct SpatialGrid {
+    cell_size:   f32,
+    inv_cell:    f32,
+    bucket_mask: u32,          // num_buckets - 1; num_buckets must be power of 2
+    buckets:     *var u32,     // head of each chain (0xFFFFFFFF = empty)
+    entries:     *var Entry,
+    entry_count: u32,
+    max_entries: u32,
+}
+
+impl SpatialGrid {
+    /// `cell_size`   — world-units per cell (match to typical object size)
+    /// `bucket_bits` — log2(num_buckets); 10 → 1024 buckets
+    /// `max_entries` — hard pool_n on simultaneous insertions per frame
+    pub fn new(cell_size: f32, bucket_bits: u32, max_entries: u32) -> SpatialGrid {
+        let num_buckets = (1u32 << bucket_bits) as usize;
+        let buckets = alloc_slice::<u32>(num_buckets);
+        var i: usize = 0;
+        while i < num_buckets { unsafe { *buckets.add(i) = 0xFFFFFFFF; } i += 1; }
+        // Hoist turbofish call out of struct literal so the parser sees it unambiguously
+        let entries = alloc_slice::<Entry>(max_entries as usize);
+
+        SpatialGrid {
+            cell_size,
+            inv_cell: 1.0 / cell_size,
+            bucket_mask: (1u32 << bucket_bits) - 1,
+            buckets,
+            entries,
+            entry_count: 0,
+            max_entries,
+        }
+    }
+
+    pub fn free(self: &var SpatialGrid) {
+        free_slice(self.buckets, (self.bucket_mask + 1) as usize);
+        free_slice(self.entries, self.max_entries as usize);
+    }
+
+    /// Reset for the next frame. O(num_buckets).
+    pub fn clear(self: &var SpatialGrid) {
+        let n = (self.bucket_mask + 1) as usize;
+        var i: usize = 0;
+        while i < n { unsafe { *self.buckets.add(i) = 0xFFFFFFFF; } i += 1; }
+        self.entry_count = 0;
+    }
+
+    fn hash_cell(self: &SpatialGrid, cx: i32, cy: i32) -> usize {
+        // Spatial hash — mix x/y to spread cells across buckets
+        let hx = (cx as u32) ^ ((cx as u32) << 17) ^ ((cx as u32) >> 5);
+        let hy = (cy as u32) ^ ((cy as u32) <<  9) ^ ((cy as u32) >> 13);
+        ((hx ^ hy) & self.bucket_mask) as usize
+    }
+
+    /// Insert object at (x, y) with axis-aligned bounding box half-extents (hw, hh).
+    /// Objects spanning multiple cells are inserted into each overlapping cell.
+    pub fn insert(self: &var SpatialGrid, id: u32, x: f32, y: f32, hw: f32, hh: f32) {
+        let min_cx = ((x - hw) * self.inv_cell) as i32;
+        let max_cx = ((x + hw) * self.inv_cell) as i32;
+        let min_cy = ((y - hh) * self.inv_cell) as i32;
+        let max_cy = ((y + hh) * self.inv_cell) as i32;
+
+        var by_ = min_cy;
+        while by_ <= max_cy {
+            var bx = min_cx;
+            while bx <= max_cx {
+                if self.entry_count >= self.max_entries { return; }
+                let bucket = self.hash_cell(bx, by_);
+                let eidx = self.entry_count as usize;
+                unsafe {
+                    *self.entries.add(eidx) = Entry {
+                        id, x, y, hw, hh,
+                        next: *self.buckets.add(bucket),
+                    };
+                    *self.buckets.add(bucket) = eidx as u32;
+                }
+                self.entry_count += 1;
+                bx += 1;
+            }
+            by_ += 1;
+        }
+    }
+
+    /// Query all objects with AABBs overlapping the rect [cx±hw, cy±hh].
+    /// Deduplicates via id bitmask if max_id < dedup_cap (else may have dupes).
+    #[sicko]
+    pub fn query_rect(self: &SpatialGrid,
+                      cx: f32, cy: f32, hw: f32, hh: f32,
+                      out: &var QueryResult) {
+        let min_cx = ((cx - hw) * self.inv_cell) as i32;
+        let max_cx = ((cx + hw) * self.inv_cell) as i32;
+        let min_cy = ((cy - hh) * self.inv_cell) as i32;
+        let max_cy = ((cy + hh) * self.inv_cell) as i32;
+
+        var by_ = min_cy;
+        while by_ <= max_cy {
+            var bx = min_cx;
+            while bx <= max_cx {
+                let bucket = self.hash_cell(bx, by_);
+                var chain = unsafe { *self.buckets.add(bucket) };
+                while chain != 0xFFFFFFFF {
+                    let e = unsafe { &*self.entries.add(chain as usize) };
+                    // AABB overlap test
+                    if (e.x - e.hw) <= (cx + hw) && (e.x + e.hw) >= (cx - hw)
+                    && (e.y - e.hh) <= (cy + hh) && (e.y + e.hh) >= (cy - hh) {
+                        out.push(e.id);
+                    }
+                    chain = e.next;
+                }
+                bx += 1;
+            }
+            by_ += 1;
+        }
+    }
+
+    /// Query all objects whose centers are within radius r of (cx, cy).
+    #[sicko]
+    pub fn query_radius(self: &SpatialGrid,
+                        cx: f32, cy: f32, r: f32,
+                        out: &var QueryResult) {
+        let r2   = r * r;
+        let min_cx = ((cx - r) * self.inv_cell) as i32;
+        let max_cx = ((cx + r) * self.inv_cell) as i32;
+        let min_cy = ((cy - r) * self.inv_cell) as i32;
+        let max_cy = ((cy + r) * self.inv_cell) as i32;
+
+        var by_ = min_cy;
+        while by_ <= max_cy {
+            var bx = min_cx;
+            while bx <= max_cx {
+                let bucket = self.hash_cell(bx, by_);
+                var chain = unsafe { *self.buckets.add(bucket) };
+                while chain != 0xFFFFFFFF {
+                    let e = unsafe { &*self.entries.add(chain as usize) };
+                    let ddx = e.x - cx;
+                    let ddy = e.y - cy;
+                    if ddx * ddx + ddy * ddy <= r2 { out.push(e.id); }
+                    chain = e.next;
+                }
+                bx += 1;
+            }
+            by_ += 1;
+        }
+    }
+
+    pub fn entry_count(self: &SpatialGrid) -> u32 { self.entry_count }
+}

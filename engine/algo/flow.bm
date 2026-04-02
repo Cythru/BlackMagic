@@ -1,0 +1,180 @@
+/// BlackMagic Engine — algo/flow.bm
+///
+/// Flow-field pathfinding — optimal for large crowds navigating a shared goal.
+///
+///   FlowField    — per-cell direction vectors pointing toward goal
+///   build_flow   — BFS flood-fill outward from goal to assign costs + directions
+///   sample_flow  — O(1) direction lookup for any world position
+///
+/// Architecture:
+///   A flow field precomputes the best move direction for every passable cell.
+///   Agents query it once per frame in O(1) — no per-agent A*.
+///   The grid is the same layout as PathGrid (cell = 1 unit, y*width+x index).
+///
+///   Direction encoding:
+///     Each cell stores a (dx, dy) unit vector toward the next best cell.
+///     dx and dy are stored as i8 in {-1, 0, 1} — 4-directional by default.
+///     Goal cell: (0, 0).  Unreachable cells: (0, 0) as well — callers check cost.
+///
+/// Usage:
+///   var ff = FlowField::new(64, 64);
+///   build_flow(&path_grid, goal_x, goal_y, &var ff);
+///   let dir = ff.sample(agent_x, agent_y);   // Vec2 unit direction
+///   ff.free();
+
+use engine::core::math::{ Vec2 };
+use engine::algo::pathfind::{ PathGrid };
+use bm::mem::{ alloc_slice, free_slice };
+
+// ─── FlowField ────────────────────────────────────────────────────────────────
+
+pub struct FlowField {
+    pub width:  u32,
+    pub height: u32,
+    dx:         *var i8,   // per-cell move direction x  ∈ {-1, 0, 1}
+    dy_:        *var i8,   // per-cell move direction y  (dy_ avoids keyword clash)
+    cost:       *var u32,  // BFS hop cost; 0xFFFFFFFF = unreachable
+}
+
+impl FlowField {
+    pub fn new(width: u32, height: u32) -> FlowField {
+        let n = (width * height) as usize;
+        let dx   = alloc_slice::<i8>(n);
+        let dy_  = alloc_slice::<i8>(n);
+        let cost = alloc_slice::<u32>(n);
+        var i: usize = 0;
+        while i < n {
+            unsafe { *dx.add(i) = 0; *dy_.add(i) = 0; *cost.add(i) = 0xFFFFFFFF; }
+            i += 1;
+        }
+        FlowField { width, height, dx, dy_, cost }
+    }
+
+    pub fn free(self: &var FlowField) {
+        let n = (self.width * self.height) as usize;
+        free_slice(self.dx,   n);
+        free_slice(self.dy_,  n);
+        free_slice(self.cost, n);
+    }
+
+    /// Get the flow direction at grid cell (x, y).
+    /// Returns zero vector if out-of-bounds or unreachable.
+    pub fn get_dir(self: &FlowField, x: u32, y: u32) -> Vec2 {
+        if x >= self.width || y >= self.height { return Vec2 { x: 0.0, y: 0.0 }; }
+        let idx = (y * self.width + x) as usize;
+        Vec2 {
+            x: unsafe { *self.dx.add(idx)  } as f32,
+            y: unsafe { *self.dy_.add(idx) } as f32,
+        }
+    }
+
+    /// Sample flow direction at world position (wx, wy).
+    /// Assumes 1 world-unit = 1 cell.  Bilinear blend of four surrounding cells.
+    #[sicko]
+    pub fn sample(self: &FlowField, wx: f32, wy_: f32) -> Vec2 {
+        let xi = wx.floor() as i32;
+        let yi = wy_.floor() as i32;
+        let fx = wx - xi as f32;
+        let fy = wy_ - yi as f32;
+
+        let x0 = if xi < 0 { 0u32 } else if xi as u32 >= self.width  { self.width  - 1 } else { xi as u32 };
+        let y0 = if yi < 0 { 0u32 } else if yi as u32 >= self.height { self.height - 1 } else { yi as u32 };
+        let x1 = if x0 + 1 < self.width  { x0 + 1 } else { x0 };
+        let y1 = if y0 + 1 < self.height { y0 + 1 } else { y0 };
+
+        let d00 = self.get_dir(x0, y0);
+        let d10 = self.get_dir(x1, y0);
+        let d01 = self.get_dir(x0, y1);
+        let d11 = self.get_dir(x1, y1);
+
+        let lx0 = Vec2 { x: d00.x + fx * (d10.x - d00.x), y: d00.y + fx * (d10.y - d00.y) };
+        let lx1 = Vec2 { x: d01.x + fx * (d11.x - d01.x), y: d01.y + fx * (d11.y - d01.y) };
+        let blended = Vec2 {
+            x: lx0.x + fy * (lx1.x - lx0.x),
+            y: lx0.y + fy * (lx1.y - lx0.y),
+        };
+
+        // Normalise (avoids zero-length at diagonal blend seams)
+        let len2 = blended.x * blended.x + blended.y * blended.y;
+        if len2 < 0.0001 { return Vec2 { x: 0.0, y: 0.0 }; }
+        let inv = 1.0 / len2.sqrt();
+        Vec2 { x: blended.x * inv, y: blended.y * inv }
+    }
+
+    /// BFS cost to goal for cell (x, y).  0xFFFFFFFF = unreachable.
+    pub fn cost_at(self: &FlowField, x: u32, y: u32) -> u32 {
+        if x >= self.width || y >= self.height { return 0xFFFFFFFF; }
+        unsafe { *self.cost.add((y * self.width + x) as usize) }
+    }
+}
+
+// ─── build_flow ───────────────────────────────────────────────────────────────
+
+/// Build a flow field on `grid` from every passable cell toward (goal_x, goal_y).
+/// Uses 4-directional BFS (orthogonal only) for correctness; diagonal moves can
+/// be added by the agent using the blended sample() output.
+#[sicko]
+pub fn build_flow(grid: &PathGrid, goal_x: u32, goal_y: u32, ff: &var FlowField) {
+    let w = grid.width;
+    let h = grid.height;
+    let n = (w * h) as usize;
+
+    // Reset field
+    var ri: usize = 0;
+    while ri < n {
+        unsafe { *ff.dx.add(ri) = 0; *ff.dy_.add(ri) = 0; *ff.cost.add(ri) = 0xFFFFFFFF; }
+        ri += 1;
+    }
+
+    if grid.is_wall(goal_x, goal_y) { return; }
+
+    // BFS queue — ring buffer
+    let queue = alloc_slice::<u32>(n);
+    var head: usize = 0;
+    var tail: usize = 0;
+
+    let goal_idx = (goal_y * w + goal_x) as usize;
+    unsafe { *ff.cost.add(goal_idx) = 0; *queue.add(tail) = goal_idx as u32; }
+    tail += 1;
+
+    // Cardinal directions: right, left, down, up
+    // Stored as (dx, dy) pairs
+    let dirs_dx: [i32; 4] = [1, -1, 0,  0];
+    let dirs_dy: [i32; 4] = [0,  0, 1, -1];
+
+    while head < tail {
+        let cidx  = unsafe { *queue.add(head) } as usize;
+        head += 1;
+        let ccost = unsafe { *ff.cost.add(cidx) };
+        let cx    = (cidx % w as usize) as i32;
+        let cy    = (cidx / w as usize) as i32;
+
+        var di: usize = 0;
+        while di < 4 {
+            let nx = cx + dirs_dx[di];
+            let ny = cy + dirs_dy[di];
+            if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 { di += 1; continue; }
+            let nxu = nx as u32;
+            let nyu = ny as u32;
+            if grid.is_wall(nxu, nyu)                                 { di += 1; continue; }
+            let nidx = (nyu * w + nxu) as usize;
+            if unsafe { *ff.cost.add(nidx) } != 0xFFFFFFFF           { di += 1; continue; }
+
+            unsafe { *ff.cost.add(nidx) = ccost + 1; }
+
+            // Direction FROM neighbour TOWARD current (i.e. back along cheapest path)
+            // dirs_dx[di] is (current - neighbour), so negate
+            unsafe {
+                *ff.dx.add(nidx)  = (-dirs_dx[di]) as i8;
+                *ff.dy_.add(nidx) = (-dirs_dy[di]) as i8;
+            }
+
+            unsafe { *queue.add(tail) = nidx as u32; }
+            tail += 1;
+
+            di += 1;
+        }
+    }
+
+    free_slice(queue, n);
+}

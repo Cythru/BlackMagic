@@ -1,0 +1,496 @@
+/// BlackMagic → C Transpiler
+///
+/// Emits readable, compilable C99 from MIR.
+/// Strategy:
+///   - Each MirFunction → C function
+///   - Locals → C local variables with typed declarations
+///   - BasicBlocks → labelled goto targets (C goto-based CFG lowering)
+///   - Effect performs → callback calls into a runtime handler struct
+///   - SIMD rvalues → GCC/Clang vector extension syntax
+///   - Linear types → __attribute__((cleanup(...))) wrappers
+
+use std::fmt::Write;
+use crate::mir::*;
+use crate::types::{TypeId, TypeCtx, Ty, PrimitiveTy, VariantPayloadTy};
+use crate::error::BmError;
+use super::CodegenOptions;
+
+pub struct CCodegen<'a> {
+    opts: &'a CodegenOptions,
+    ctx:  &'a TypeCtx,
+    out:  String,
+}
+
+impl<'a> CCodegen<'a> {
+    pub fn new(opts: &'a CodegenOptions, ctx: &'a TypeCtx) -> Self {
+        CCodegen { opts, ctx, out: String::new() }
+    }
+
+    pub fn generate(mut self, module: &MirModule) -> Result<Vec<u8>, Vec<BmError>> {
+        self.emit_prelude();
+        self.emit_type_decls();
+        for (_, func) in &module.functions {
+            self.emit_function(func);
+        }
+        Ok(self.out.into_bytes())
+    }
+
+    // ── Type declarations ──────────────────────────────────────────────────
+
+    fn emit_type_decls(&mut self) {
+        // Collect first to avoid simultaneous borrow + write conflicts
+        let structs: Vec<_> = self.ctx.iter_structs().cloned().collect();
+        let enums:   Vec<_> = self.ctx.iter_enums().cloned().collect();
+
+        if structs.is_empty() && enums.is_empty() { return; }
+
+        self.out.push_str("// ── User-defined types ───────────────────────────────────────────────────\n");
+
+        // Forward declarations (handle cyclic structs)
+        for s in &structs {
+            writeln!(self.out, "typedef struct {} {};", c_ident(&s.name), c_ident(&s.name)).unwrap();
+        }
+        for e in &enums {
+            writeln!(self.out, "typedef struct {} {};", c_ident(&e.name), c_ident(&e.name)).unwrap();
+        }
+        self.out.push('\n');
+
+        // Full struct definitions
+        for s in &structs {
+            if s.is_linear {
+                writeln!(self.out, "/* linear type — drop is required */").unwrap();
+            }
+            writeln!(self.out, "struct {} {{", c_ident(&s.name)).unwrap();
+            if s.fields.is_empty() {
+                // Zero-size struct: C doesn't allow empty structs; use a padding byte.
+                self.out.push_str("  char _zst;\n");
+            }
+            for field in &s.fields {
+                let ty_str = self.c_type(field.ty);
+                writeln!(self.out, "  {} {};", ty_str, c_ident(&field.name)).unwrap();
+            }
+            writeln!(self.out, "}};\n").unwrap();
+        }
+
+        // Enum tagged-union definitions
+        for e in &enums {
+            // Per-variant payload structs
+            for v in &e.variants {
+                match &v.payload {
+                    VariantPayloadTy::Tuple(fields) if !fields.is_empty() => {
+                        writeln!(self.out, "struct {}__{}_payload {{",
+                            c_ident(&e.name), c_ident(&v.name)).unwrap();
+                        for (i, &fty) in fields.iter().enumerate() {
+                            writeln!(self.out, "  {} _field{};", self.c_type(fty), i).unwrap();
+                        }
+                        writeln!(self.out, "}};").unwrap();
+                    }
+                    VariantPayloadTy::Struct(fields) if !fields.is_empty() => {
+                        writeln!(self.out, "struct {}__{}_payload {{",
+                            c_ident(&e.name), c_ident(&v.name)).unwrap();
+                        for f in fields {
+                            writeln!(self.out, "  {} {};", self.c_type(f.ty), c_ident(&f.name)).unwrap();
+                        }
+                        writeln!(self.out, "}};").unwrap();
+                    }
+                    _ => {}
+                }
+            }
+
+            // Tagged-union wrapper
+            writeln!(self.out, "struct {} {{", c_ident(&e.name)).unwrap();
+            self.out.push_str("  uint32_t tag;\n");
+            self.out.push_str("  union {\n");
+            for v in &e.variants {
+                let has_payload = matches!(&v.payload,
+                    VariantPayloadTy::Tuple(f) if !f.is_empty()) ||
+                    matches!(&v.payload,
+                    VariantPayloadTy::Struct(f) if !f.is_empty());
+                if has_payload {
+                    writeln!(self.out, "    struct {}__{}_payload {};",
+                        c_ident(&e.name), c_ident(&v.name), c_ident(&v.name)).unwrap();
+                }
+            }
+            self.out.push_str("  } payload;\n};\n");
+
+            // Tag constants
+            for v in &e.variants {
+                writeln!(self.out, "#define {}__{} UINT32_C({})",
+                    c_ident(&e.name).to_uppercase(),
+                    c_ident(&v.name).to_uppercase(),
+                    v.discrim).unwrap();
+            }
+            self.out.push('\n');
+        }
+
+        // Array wrapper typedefs for any Ty::Array found in the type context
+        let array_types: Vec<_> = self.ctx.all_type_ids()
+            .filter_map(|id| match self.ctx.get(id) {
+                Ty::Array { elem, len } => Some((*elem, *len)),
+                _ => None,
+            })
+            .collect();
+        for (elem, len) in array_types {
+            let ident = self.c_type_ident(elem);
+            let elem_c = self.c_type(elem);
+            writeln!(self.out,
+                "typedef struct {{ {elem_c} elems[{len}]; }} bm_arr_{ident}_{len};",
+                elem_c = elem_c, ident = ident, len = len).unwrap();
+        }
+        self.out.push('\n');
+    }
+
+    // ── Type → C type string ──────────────────────────────────────────────
+
+    fn c_type(&self, ty: TypeId) -> String {
+        match self.ctx.get(ty) {
+            Ty::Never | Ty::Void => "void".to_string(),
+
+            Ty::Primitive(p) => match p {
+                PrimitiveTy::I8    => "int8_t",
+                PrimitiveTy::I16   => "int16_t",
+                PrimitiveTy::I32   => "int32_t",
+                PrimitiveTy::I64   => "int64_t",
+                PrimitiveTy::I128  => "__int128",
+                PrimitiveTy::Isize => "intptr_t",
+                PrimitiveTy::U8    => "uint8_t",
+                PrimitiveTy::U16   => "uint16_t",
+                PrimitiveTy::U32   => "uint32_t",
+                PrimitiveTy::U64   => "uint64_t",
+                PrimitiveTy::U128  => "unsigned __int128",
+                PrimitiveTy::Usize => "uintptr_t",
+                PrimitiveTy::F16   => "_Float16",
+                PrimitiveTy::F32   => "float",
+                PrimitiveTy::F64   => "double",
+                PrimitiveTy::F128  => "__float128",
+                PrimitiveTy::Bool  => "bool",
+                PrimitiveTy::Char  => "uint32_t", // Unicode scalar value
+                PrimitiveTy::Str   => "bm_str",   // fat pointer (defined in prelude)
+                PrimitiveTy::Byte  => "uint8_t",
+            }.to_string(),
+
+            Ty::Ref { inner, mutable, .. } => {
+                if *mutable {
+                    format!("{}*", self.c_type(*inner))
+                } else {
+                    format!("const {}*", self.c_type(*inner))
+                }
+            }
+            Ty::RawPtr { inner, mutable } => {
+                if *mutable {
+                    format!("{}*", self.c_type(*inner))
+                } else {
+                    format!("const {}*", self.c_type(*inner))
+                }
+            }
+            Ty::Owned(inner) | Ty::WeakRef(inner) => {
+                format!("{}*", self.c_type(*inner))
+            }
+            Ty::Linear(inner) => self.c_type(*inner), // linearity is compile-time only
+
+            Ty::Slice(_) => "bm_slice".to_string(), // fat pointer (defined in prelude)
+
+            Ty::Array { elem, len } => {
+                format!("bm_arr_{}_{}", self.c_type_ident(*elem), len)
+            }
+
+            Ty::Fn { params, ret, .. } => {
+                let ret_c = self.c_type(*ret);
+                let params_c: Vec<_> = params.iter().map(|&p| self.c_type(p)).collect();
+                format!("{} (*)({})", ret_c, params_c.join(", "))
+            }
+
+            Ty::Optional(inner) => {
+                // Pointer types: just use nullable pointer
+                match self.ctx.get(*inner) {
+                    Ty::Ref { .. } | Ty::RawPtr { .. } | Ty::Owned(_) => self.c_type(*inner),
+                    _ => format!("bm_opt_{}", self.c_type_ident(*inner)),
+                }
+            }
+
+            Ty::Struct(id) => c_ident(&self.ctx.get_struct(*id).name),
+            Ty::Enum(id)   => c_ident(&self.ctx.get_enum(*id).name),
+
+            Ty::Tuple(fields) => {
+                if fields.is_empty() {
+                    "void".to_string()
+                } else {
+                    format!("bm_tuple_{}", fields.len())
+                }
+            }
+
+            Ty::Simd { elem, lanes } => {
+                let elem_c = self.c_type(*elem);
+                format!("__attribute__((vector_size({} * sizeof({})))) {}",
+                    lanes, elem_c, elem_c)
+            }
+
+            Ty::GenericInst { .. } | Ty::Tensor { .. } => "void*".to_string(),
+
+            Ty::WithEffects { inner, .. } | Ty::Refined { inner, .. } => {
+                self.c_type(*inner)
+            }
+
+            Ty::Var(_) => "void*".to_string(),
+        }
+    }
+
+    /// Short identifier string for a type, used in generated typedef names.
+    fn c_type_ident(&self, ty: TypeId) -> String {
+        match self.ctx.get(ty) {
+            Ty::Primitive(p) => match p {
+                PrimitiveTy::I8    => "i8",   PrimitiveTy::I16   => "i16",
+                PrimitiveTy::I32   => "i32",  PrimitiveTy::I64   => "i64",
+                PrimitiveTy::I128  => "i128", PrimitiveTy::Isize => "isize",
+                PrimitiveTy::U8    => "u8",   PrimitiveTy::U16   => "u16",
+                PrimitiveTy::U32   => "u32",  PrimitiveTy::U64   => "u64",
+                PrimitiveTy::U128  => "u128", PrimitiveTy::Usize => "usize",
+                PrimitiveTy::F16   => "f16",  PrimitiveTy::F32   => "f32",
+                PrimitiveTy::F64   => "f64",  PrimitiveTy::F128  => "f128",
+                PrimitiveTy::Bool  => "bool", PrimitiveTy::Char  => "char",
+                PrimitiveTy::Str   => "str",  PrimitiveTy::Byte  => "byte",
+            }.to_string(),
+            Ty::Struct(id) => c_ident(&self.ctx.get_struct(*id).name),
+            Ty::Enum(id)   => c_ident(&self.ctx.get_enum(*id).name),
+            _              => format!("ty{}", ty.0),
+        }
+    }
+
+    fn emit_prelude(&mut self) {
+        self.out.push_str(
+r#"// Generated by bmc (BlackMagic Compiler) — C backend
+// DO NOT EDIT: this file is machine-generated
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <string.h>
+#include <stdlib.h>
+
+// ── BlackMagic runtime types ──────────────────────────────────────────────
+typedef struct { void* ptr; size_t len; } bm_str;
+typedef struct { void* ptr; size_t len; size_t cap; } bm_slice;
+typedef void* bm_any;
+
+// ── Effect handler vtable (algebraic effects at runtime) ──────────────────
+typedef struct BmEffectHandler BmEffectHandler;
+struct BmEffectHandler {
+    void* state;
+    // ops are function pointers: void* (*op)(BmEffectHandler*, ...);
+};
+
+// ── SIMD helpers ──────────────────────────────────────────────────────────
+#if defined(__AVX2__)
+#include <immintrin.h>
+typedef __m256  bm_vec8f;
+typedef __m256i bm_vec8i;
+typedef __m128  bm_vec4f;
+#elif defined(__SSE2__)
+#include <emmintrin.h>
+typedef __m128  bm_vec4f;
+typedef __m128i bm_vec4i;
+#endif
+
+"#);
+    }
+
+    fn emit_function(&mut self, func: &MirFunction) {
+        // Return type
+        let ret_ty = self.c_type(func.return_ty);
+        writeln!(self.out, "{} {}(", ret_ty, c_ident(&func.name)).unwrap();
+
+        // Parameters
+        let params: Vec<String> = func.args.iter().map(|l| {
+            let decl = &func.locals[l.0 as usize];
+            format!("  {} _{}", self.c_type(decl.ty), l.0)
+        }).collect();
+        self.out.push_str(&params.join(",\n"));
+        self.out.push_str("\n) {\n");
+
+        // Local declarations (non-arg)
+        for (i, decl) in func.locals.iter().enumerate() {
+            if !decl.is_arg {
+                writeln!(self.out, "  {} _{};", self.c_type(decl.ty), i).unwrap();
+            }
+        }
+        self.out.push('\n');
+
+        // Basic blocks
+        for block in &func.blocks {
+            writeln!(self.out, "  bb{}:;", block.id).unwrap();
+
+            // Phi nodes (pre-assigned by predecessors via goto)
+            // (Phi values are inserted at the terminator of each predecessor)
+
+            for stmt in &block.stmts {
+                self.emit_stmt(stmt);
+            }
+            self.emit_terminator(&block.terminator);
+            self.out.push('\n');
+        }
+
+        self.out.push_str("}\n\n");
+    }
+
+    fn emit_stmt(&mut self, stmt: &MirStmt) {
+        match &stmt.kind {
+            MirStmtKind::Assign { dest, value } => {
+                let lhs = self.c_place(dest);
+                let rhs = self.c_rvalue(value);
+                writeln!(self.out, "  {} = {};", lhs, rhs).unwrap();
+            }
+            MirStmtKind::StorageLive(_) | MirStmtKind::StorageDead(_) => {}
+            MirStmtKind::Perform { effect, op, args, dest } => {
+                let args_str: Vec<String> = args.iter().map(|a| self.c_operand(a)).collect();
+                let call = format!("__bm_effect_{}_{}(handler, {})",
+                    c_ident(effect), c_ident(op), args_str.join(", "));
+                if let Some(d) = dest {
+                    writeln!(self.out, "  _{} = {};", d.0, call).unwrap();
+                } else {
+                    writeln!(self.out, "  {};", call).unwrap();
+                }
+            }
+            MirStmtKind::Nop => {}
+        }
+    }
+
+    fn emit_terminator(&mut self, term: &Terminator) {
+        match term {
+            Terminator::Goto { target } => {
+                writeln!(self.out, "  goto bb{};", target).unwrap();
+            }
+            Terminator::Branch { cond, then, else_ } => {
+                writeln!(self.out, "  if ({}) goto bb{}; else goto bb{};",
+                    self.c_operand(cond), then, else_).unwrap();
+            }
+            Terminator::Switch { discrim, arms, default } => {
+                writeln!(self.out, "  switch ({}) {{", self.c_operand(discrim)).unwrap();
+                for (val, target) in arms {
+                    writeln!(self.out, "    case {}: goto bb{};", val, target).unwrap();
+                }
+                writeln!(self.out, "    default: goto bb{};", default).unwrap();
+                self.out.push_str("  }\n");
+            }
+            Terminator::Return(Some(op)) => {
+                writeln!(self.out, "  return {};", self.c_operand(op)).unwrap();
+            }
+            Terminator::Return(None) => {
+                self.out.push_str("  return;\n");
+            }
+            Terminator::Call { func, args, dest, then, .. } => {
+                let args_str: Vec<String> = args.iter().map(|a| self.c_operand(a)).collect();
+                let call = format!("{}({})", self.c_operand(func), args_str.join(", "));
+                if let Some(d) = dest {
+                    writeln!(self.out, "  _{} = {};", d.0, call).unwrap();
+                } else {
+                    writeln!(self.out, "  {};", call).unwrap();
+                }
+                writeln!(self.out, "  goto bb{};", then).unwrap();
+            }
+            Terminator::Unreachable => {
+                self.out.push_str("  __builtin_unreachable();\n");
+            }
+            Terminator::Panic { msg } => {
+                writeln!(self.out, "  __bm_panic(\"{}\");", msg.replace('"', "\\\""  )).unwrap();
+            }
+            Terminator::Drop { then, .. } => {
+                // Drop = call destructor (if any) then continue
+                writeln!(self.out, "  goto bb{};", then).unwrap();
+            }
+        }
+    }
+
+    fn c_place(&self, place: &MirPlace) -> String {
+        match place {
+            MirPlace::Local(l) => format!("_{}", l.0),
+            MirPlace::Field(p, f) => format!("{}.{}", self.c_place(p), f),
+            MirPlace::Index(p, i) => format!("{}[{}]", self.c_place(p), self.c_operand(i)),
+            MirPlace::Deref(p) => format!("(*{})", self.c_place(p)),
+        }
+    }
+
+    fn c_operand(&self, op: &Operand) -> String {
+        match op {
+            Operand::Local(l) => format!("_{}", l.0),
+            Operand::Const(c) => self.c_const(c),
+            Operand::Func(n)  => c_ident(n),
+            Operand::Static(n) => c_ident(n),
+        }
+    }
+
+    fn c_rvalue(&self, rv: &Rvalue) -> String {
+        match rv {
+            Rvalue::Use(op)            => self.c_operand(op),
+            Rvalue::BinOp(op, a, b)   => format!("({} {} {})", self.c_operand(a), c_binop(op), self.c_operand(b)),
+            Rvalue::UnaryOp(op, a)    => format!("({}{})", c_unary(op), self.c_operand(a)),
+            Rvalue::Ref(p)            => format!("(&{})", self.c_place(p)),
+            Rvalue::MutRef(p)         => format!("(&{})", self.c_place(p)),
+            Rvalue::Move(p)           => self.c_place(p),
+            Rvalue::Copy(p)           => self.c_place(p),
+            Rvalue::Aggregate(kind, ops) => {
+                let args: Vec<_> = ops.iter().map(|o| self.c_operand(o)).collect();
+                match kind {
+                    AggregateKind::Tuple | AggregateKind::Array => {
+                        format!("{{{}}}", args.join(", "))
+                    }
+                    AggregateKind::Struct(name) => {
+                        format!("(struct {}){{{}}}",  c_ident(name), args.join(", "))
+                    }
+                    AggregateKind::EnumVariant(_, variant, tag) => {
+                        format!("(/* {} */ ({}){{.tag={}, .payload={{{}}}}})",
+                            variant, variant, tag, args.join(", "))
+                    }
+                }
+            }
+            Rvalue::Cast(op, ty)      => format!("(({}){})", self.c_type(*ty), self.c_operand(op)),
+            Rvalue::Discriminant(op)  => format!("{}.tag", self.c_operand(op)),
+            Rvalue::SimdSplat(op, _lanes) => {
+                // GCC vector extension or __m256_set1_ps equivalent
+                format!("__bm_splat({})", self.c_operand(op))
+            }
+            Rvalue::SimdBinOp(op, a, b) => {
+                format!("__bm_simd_{}({}, {})", c_binop(op).trim(), self.c_operand(a), self.c_operand(b))
+            }
+        }
+    }
+
+    fn c_const(&self, c: &Const) -> String {
+        match c {
+            Const::Int(n)   => n.to_string(),
+            Const::Float(f) => format!("{:.6}", f),
+            Const::Bool(b)  => if *b { "true".to_string() } else { "false".to_string() },
+            Const::Str(s)   => format!("(bm_str){{.ptr=\"{}\", .len={}}}", s.replace('"', "\\\""), s.len()),
+            Const::Char(c)  => format!("'\\x{:02x}'", *c as u32),
+            Const::Null     => "NULL".to_string(),
+            Const::Undefined => "/* undefined */0".to_string(),
+        }
+    }
+
+}
+
+fn c_ident(s: &str) -> String {
+    // Replace :: with __ and other non-C chars
+    s.replace("::", "__").replace('-', "_")
+}
+
+fn c_binop(op: &BinOpKind) -> &'static str {
+    match op {
+        BinOpKind::Add => "+",  BinOpKind::Sub => "-",
+        BinOpKind::Mul => "*",  BinOpKind::Div => "/",
+        BinOpKind::Rem => "%",  BinOpKind::Eq  => "==",
+        BinOpKind::Ne  => "!=", BinOpKind::Lt  => "<",
+        BinOpKind::Le  => "<=", BinOpKind::Gt  => ">",
+        BinOpKind::Ge  => ">=", BinOpKind::And => "&&",
+        BinOpKind::Or  => "||", BinOpKind::BitAnd => "&",
+        BinOpKind::BitOr  => "|", BinOpKind::BitXor => "^",
+        BinOpKind::Shl    => "<<", BinOpKind::Shr   => ">>",
+    }
+}
+
+fn c_unary(op: &UnaryOpKind) -> &'static str {
+    match op {
+        UnaryOpKind::Neg   => "-",
+        UnaryOpKind::Not   => "!",
+        UnaryOpKind::Deref => "*",
+    }
+}

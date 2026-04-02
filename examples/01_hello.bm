@@ -1,0 +1,19 @@
+/// BlackMagic — Hello, World!
+/// Shows: modules, effects, functions, string interpolation
+
+module hello
+
+use std::io::{println, readln}
+
+// Main: must declare IO effect
+fn main() !IO {
+    println("Hello from BlackMagic!")
+
+    // String interpolation
+    let name = "World"
+    println("Hello, {name}!")
+
+    // Multi-line
+    let answer: i32 = 6 * 7
+    println("The answer is {answer}")
+}

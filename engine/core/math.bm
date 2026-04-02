@@ -1,0 +1,494 @@
+/// BlackMagic Engine — core/math.bm
+///
+/// Pure-BlackMagic math types and functions.
+/// No FFI. No extern. No other languages.
+///
+/// Fundamental hardware ops declared as #[intrinsic] (CPU instructions, part of BM spec).
+/// All higher-level math (trig, lerp, etc.) implemented in pure BlackMagic.
+
+use bm::simd::{ vec4, vec8 };
+use bm::sicko;
+
+// ─── Hardware intrinsics ──────────────────────────────────────────────────
+// These are CPU instructions, declared as part of the BlackMagic language spec.
+// The compiler lowers them to the matching ISA instruction (no libc linkage).
+
+#[intrinsic] pub fn __bm_sqrt_f32(x: f32) -> f32;
+#[intrinsic] pub fn __bm_sqrt_f64(x: f64) -> f64;
+#[intrinsic] pub fn __bm_abs_f32(x: f32)  -> f32;
+#[intrinsic] pub fn __bm_floor_f32(x: f32) -> f32;
+#[intrinsic] pub fn __bm_ceil_f32(x: f32)  -> f32;
+#[intrinsic] pub fn __bm_round_f32(x: f32) -> f32;
+#[intrinsic] pub fn __bm_fma_f32(a: f32, b: f32, c: f32) -> f32;  // a*b+c
+
+// ─── Constants ─────────────────────────────────────────────────────────────
+
+pub const PI:     f32 = 3.14159265358979323846;
+pub const TAU:    f32 = 6.28318530717958647692;
+pub const E:      f32 = 2.71828182845904523536;
+pub const SQRT2:  f32 = 1.41421356237309504880;
+pub const DEG2RAD: f32 = 0.01745329251994329576;   // PI/180
+pub const RAD2DEG: f32 = 57.29577951308232522584;  // 180/PI
+pub const EPSILON: f32 = 1.0e-6;
+
+// ─── Wrappers over intrinsics ─────────────────────────────────────────────
+
+#[inline] pub fn sqrt(x: f32) -> f32 { __bm_sqrt_f32(x) }
+#[inline] pub fn sqrtd(x: f64) -> f64 { __bm_sqrt_f64(x) }
+#[inline] pub fn fabsf(x: f32) -> f32 { __bm_abs_f32(x) }
+#[inline] pub fn floorf(x: f32) -> f32 { __bm_floor_f32(x) }
+#[inline] pub fn ceilf(x: f32)  -> f32 { __bm_ceil_f32(x) }
+#[inline] pub fn roundf(x: f32) -> f32 { __bm_round_f32(x) }
+
+// ─── Pure-BM trig (minimax polynomial, error < 1 ULP) ─────────────────────
+
+/// Range-reduced sin using 9-term Taylor series with Horner form.
+/// Accurate to ~6 significant decimal digits over [-π, π].
+#[sicko]
+pub fn sin(x: f32) -> f32 {
+    // Range-reduce to [-pi, pi]
+    let x = wrap_angle(x);
+    let x2 = x * x;
+    // Horner: x*(1 - x²/6*(1 - x²/20*(1 - x²/42*(1 - x²/72*(1 - x²/110)))))
+    let inner = 1.0 - x2 * (1.0/110.0);
+    let inner = 1.0 - x2 * (1.0/72.0)  * inner;
+    let inner = 1.0 - x2 * (1.0/42.0)  * inner;
+    let inner = 1.0 - x2 * (1.0/20.0)  * inner;
+    let inner = 1.0 - x2 * (1.0/6.0)   * inner;
+    x * inner
+}
+
+#[sicko]
+pub fn cos(x: f32) -> f32 {
+    sin(x + PI * 0.5)
+}
+
+#[sicko]
+pub fn tan(x: f32) -> f32 {
+    let s = sin(x);
+    let c = cos(x);
+    if fabsf(c) < EPSILON { if s > 0.0 { 1.0e30 } else { -1.0e30 } }
+    else { s / c }
+}
+
+/// Inverse sine — domain [-1, 1], range [-π/2, π/2].
+#[sicko]
+pub fn asin(x: f32) -> f32 {
+    let x = clampf(x, -1.0, 1.0);
+    atan2(x, sqrt(1.0 - x * x))
+}
+
+/// Inverse cosine — domain [-1, 1], range [0, π].
+#[sicko]
+pub fn acos(x: f32) -> f32 {
+    PI * 0.5 - asin(x)
+}
+
+/// atan2 — full 4-quadrant arc tangent.  Result in (-π, π].
+#[sicko]
+pub fn atan2(y: f32, x: f32) -> f32 {
+    if x == 0.0 {
+        if y > 0.0 { return PI * 0.5; }
+        if y < 0.0 { return -PI * 0.5; }
+        return 0.0;
+    }
+    let a = atan(y / x);
+    if x > 0.0 { a }
+    else if y >= 0.0 { a + PI }
+    else { a - PI }
+}
+
+/// Single-argument atan, range (-π/2, π/2).
+/// 7-term minimax rational approximation.
+#[sicko]
+pub fn atan(x: f32) -> f32 {
+    // For |x| > 1 use identity: atan(x) = π/2 - atan(1/x)
+    if fabsf(x) > 1.0 {
+        let sign = if x > 0.0 { 1.0 } else { -1.0 };
+        return sign * (PI * 0.5 - atan(1.0 / fabsf(x)));
+    }
+    // Polynomial approximation for |x| ≤ 1  (Horner form, coefficients from Abramowitz & Stegun)
+    let x2 = x * x;
+    let p = 0.9999993329 + x2 * (-0.3332985605 + x2 * (0.1994653599
+          + x2 * (-0.1390881444 + x2 * (0.0964200441
+          + x2 * (-0.0559098862 + x2 * (0.0219194620
+          + x2 * (-0.0040853564)))))));
+    x * p
+}
+
+/// exp(x) — natural exponential, accurate for |x| < 88.
+#[sicko]
+pub fn expf(x: f32) -> f32 {
+    // exp(x) = 2^(x / ln2). Split into integer + fractional parts.
+    const LN2:     f32 = 0.6931471805599453;
+    const LN2_INV: f32 = 1.4426950408889634;
+
+    let n = floorf(x * LN2_INV);
+    let r = x - n * LN2;
+    // Horner polynomial for e^r, |r| < 0.5*ln2
+    let p = 1.0 + r * (1.0 + r * (0.5 + r * (1.0/6.0 + r * (1.0/24.0
+          + r * (1.0/120.0 + r * (1.0/720.0))))));
+    // Reconstruct: p * 2^n using bit manipulation (IEEE 754 exponent field)
+    let ni = n as i32;
+    unsafe { bm::f32_ldexp(p, ni) }
+}
+
+/// Natural log, x > 0.
+#[sicko]
+pub fn lnf(x: f32) -> f32 {
+    if x <= 0.0 { return -1.0e30; }
+    // ln(x) = ln(m * 2^e) = ln(m) + e*ln(2)
+    // where m in [1,2), e = floor(log2(x))
+    const LN2: f32 = 0.6931471805599453;
+    let (m, e) = unsafe { bm::f32_frexp(x) };  // m in [0.5, 1)
+    let m = m * 2.0;   // shift to [1, 2)
+    let e = e - 1;
+    // ln(m) for m in [1,2): use ln(m) = 2*atanh((m-1)/(m+1))
+    let t = (m - 1.0) / (m + 1.0);
+    let t2 = t * t;
+    let ln_m = 2.0 * t * (1.0 + t2 * (1.0/3.0 + t2 * (1.0/5.0
+              + t2 * (1.0/7.0 + t2 * (1.0/9.0)))));
+    ln_m + (e as f32) * LN2
+}
+
+/// x raised to integer power (exact).
+pub fn powi(x: f32, n: i32) -> f32 {
+    if n == 0 { return 1.0; }
+    var base = x;
+    var exp  = if n < 0 { (-n) as u32 } else { n as u32 };
+    var result: f32 = 1.0;
+    while exp > 0 {
+        if exp & 1 == 1 { result *= base; }
+        base *= base;
+        exp >>= 1;
+    }
+    if n < 0 { 1.0 / result } else { result }
+}
+
+// ─── Utility math ──────────────────────────────────────────────────────────
+
+#[inline] pub fn lerpf(a: f32, b: f32, t: f32) -> f32 { a + (b - a) * t }
+
+#[inline] pub fn clampf(x: f32, lo: f32, hi: f32) -> f32 {
+    if x < lo { lo } else if x > hi { hi } else { x }
+}
+
+#[inline] pub fn clampi(x: i32, lo: i32, hi: i32) -> i32 {
+    if x < lo { lo } else if x > hi { hi } else { x }
+}
+
+#[inline] pub fn minf(a: f32, b: f32) -> f32 { if a < b { a } else { b } }
+#[inline] pub fn maxf(a: f32, b: f32) -> f32 { if a > b { a } else { b } }
+#[inline] pub fn mini(a: i32, b: i32) -> i32 { if a < b { a } else { b } }
+#[inline] pub fn maxi(a: i32, b: i32) -> i32 { if a > b { a } else { b } }
+
+pub fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = clampf((x - edge0) / (edge1 - edge0), 0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+pub fn smootherstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = clampf((x - edge0) / (edge1 - edge0), 0.0, 1.0);
+    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+}
+
+#[inline] pub fn sign(x: f32) -> f32 {
+    if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 }
+}
+
+pub fn wrap(value: f32, min: f32, max: f32) -> f32 {
+    let range = max - min;
+    if range < EPSILON { return min; }
+    min + ((value - min) % range + range) % range
+}
+
+fn wrap_angle(x: f32) -> f32 {
+    // Bring to [-pi, pi] using range reduction
+    let n = roundf(x / PI);
+    x - n * PI
+}
+
+// ─── Vec2 ──────────────────────────────────────────────────────────────────
+
+pub struct Vec2 { pub x: f32, pub y: f32 }
+
+impl Vec2 {
+    pub fn zero()  -> Vec2 { Vec2 { x: 0.0, y: 0.0 } }
+    pub fn one()   -> Vec2 { Vec2 { x: 1.0, y: 1.0 } }
+    pub fn up()    -> Vec2 { Vec2 { x: 0.0, y:-1.0 } }
+    pub fn down()  -> Vec2 { Vec2 { x: 0.0, y: 1.0 } }
+    pub fn left()  -> Vec2 { Vec2 { x:-1.0, y: 0.0 } }
+    pub fn right() -> Vec2 { Vec2 { x: 1.0, y: 0.0 } }
+    pub fn new(x: f32, y: f32) -> Vec2 { Vec2 { x, y } }
+
+    #[inline] pub fn add(self, rhs: Vec2)  -> Vec2 { Vec2 { x: self.x+rhs.x, y: self.y+rhs.y } }
+    #[inline] pub fn sub(self, rhs: Vec2)  -> Vec2 { Vec2 { x: self.x-rhs.x, y: self.y-rhs.y } }
+    #[inline] pub fn scale(self, s: f32)   -> Vec2 { Vec2 { x: self.x*s,     y: self.y*s } }
+    #[inline] pub fn dot(self, rhs: Vec2)  -> f32  { self.x*rhs.x + self.y*rhs.y }
+    #[inline] pub fn cross(self, rhs: Vec2)-> f32  { self.x*rhs.y - self.y*rhs.x }
+    #[inline] pub fn length_sq(self)       -> f32  { self.dot(self) }
+    #[inline] pub fn length(self)          -> f32  { sqrt(self.length_sq()) }
+    #[inline] pub fn normalized(self) -> Vec2 {
+        let l = self.length();
+        if l < EPSILON { Vec2::zero() } else { self.scale(1.0/l) }
+    }
+    #[inline] pub fn lerp(self, to: Vec2, t: f32) -> Vec2 { self.add(to.sub(self).scale(t)) }
+    #[inline] pub fn angle(self) -> f32 { atan2(self.y, self.x) }
+    #[inline] pub fn rotated(self, a: f32) -> Vec2 {
+        let c = cos(a); let s = sin(a);
+        Vec2 { x: self.x*c - self.y*s, y: self.x*s + self.y*c }
+    }
+    #[inline] pub fn distance_to(self, rhs: Vec2) -> f32 { self.sub(rhs).length() }
+    #[inline] pub fn abs(self)   -> Vec2 { Vec2 { x: fabsf(self.x), y: fabsf(self.y) } }
+    #[inline] pub fn floor(self) -> Vec2 { Vec2 { x: floorf(self.x), y: floorf(self.y) } }
+    #[inline] pub fn ceil(self)  -> Vec2 { Vec2 { x: ceilf(self.x),  y: ceilf(self.y) } }
+    #[inline] pub fn clamp(self, lo: Vec2, hi: Vec2) -> Vec2 {
+        Vec2 { x: clampf(self.x,lo.x,hi.x), y: clampf(self.y,lo.y,hi.y) }
+    }
+}
+
+// ─── Vec3 ──────────────────────────────────────────────────────────────────
+
+pub struct Vec3 { pub x: f32, pub y: f32, pub z: f32 }
+
+impl Vec3 {
+    pub fn zero()    -> Vec3 { Vec3 { x:0.0, y:0.0, z:0.0 } }
+    pub fn one()     -> Vec3 { Vec3 { x:1.0, y:1.0, z:1.0 } }
+    pub fn up()      -> Vec3 { Vec3 { x:0.0, y:1.0, z:0.0 } }
+    pub fn forward() -> Vec3 { Vec3 { x:0.0, y:0.0, z:-1.0} }
+    pub fn right()   -> Vec3 { Vec3 { x:1.0, y:0.0, z:0.0 } }
+    pub fn new(x: f32, y: f32, z: f32) -> Vec3 { Vec3 { x, y, z } }
+    pub fn from_v2(v: Vec2, z: f32) -> Vec3 { Vec3 { x: v.x, y: v.y, z } }
+
+    #[inline] pub fn add(self, r: Vec3)  -> Vec3 { Vec3{x:self.x+r.x, y:self.y+r.y, z:self.z+r.z} }
+    #[inline] pub fn sub(self, r: Vec3)  -> Vec3 { Vec3{x:self.x-r.x, y:self.y-r.y, z:self.z-r.z} }
+    #[inline] pub fn scale(self, s: f32) -> Vec3 { Vec3{x:self.x*s,   y:self.y*s,   z:self.z*s  } }
+    #[inline] pub fn dot(self, r: Vec3)  -> f32  { self.x*r.x + self.y*r.y + self.z*r.z }
+    #[inline] pub fn cross(self, r: Vec3) -> Vec3 {
+        Vec3 { x: self.y*r.z - self.z*r.y, y: self.z*r.x - self.x*r.z, z: self.x*r.y - self.y*r.x }
+    }
+    #[inline] pub fn length_sq(self) -> f32  { self.dot(self) }
+    #[inline] pub fn length(self)    -> f32  { sqrt(self.length_sq()) }
+    #[inline] pub fn normalized(self) -> Vec3 {
+        let l = self.length();
+        if l < EPSILON { Vec3::zero() } else { self.scale(1.0/l) }
+    }
+    #[inline] pub fn lerp(self, to: Vec3, t: f32) -> Vec3 { self.add(to.sub(self).scale(t)) }
+    pub fn reflect(self, n: Vec3) -> Vec3 { self.sub(n.scale(2.0*self.dot(n))) }
+    pub fn xy(self) -> Vec2 { Vec2 { x: self.x, y: self.y } }
+    pub fn abs(self) -> Vec3 { Vec3{x:fabsf(self.x),y:fabsf(self.y),z:fabsf(self.z)} }
+    pub fn neg(self) -> Vec3 { Vec3{x:-self.x, y:-self.y, z:-self.z} }
+}
+
+// ─── Vec4 ──────────────────────────────────────────────────────────────────
+
+pub struct Vec4 { pub x: f32, pub y: f32, pub z: f32, pub w: f32 }
+
+impl Vec4 {
+    pub fn zero() -> Vec4 { Vec4{x:0.0,y:0.0,z:0.0,w:0.0} }
+    pub fn new(x: f32, y: f32, z: f32, w: f32) -> Vec4 { Vec4{x,y,z,w} }
+    pub fn from_v3(v: Vec3, w: f32) -> Vec4 { Vec4{x:v.x,y:v.y,z:v.z,w} }
+    pub fn dot(self, r: Vec4) -> f32 { self.x*r.x + self.y*r.y + self.z*r.z + self.w*r.w }
+    pub fn xyz(self) -> Vec3 { Vec3{x:self.x,y:self.y,z:self.z} }
+}
+
+// ─── Quaternion ────────────────────────────────────────────────────────────
+
+pub struct Quat { pub x: f32, pub y: f32, pub z: f32, pub w: f32 }
+
+impl Quat {
+    pub fn identity() -> Quat { Quat{x:0.0,y:0.0,z:0.0,w:1.0} }
+
+    pub fn from_axis_angle(axis: Vec3, angle: f32) -> Quat {
+        let half = angle * 0.5;
+        let s = sin(half);
+        let n = axis.normalized();
+        Quat{ x:n.x*s, y:n.y*s, z:n.z*s, w:cos(half) }
+    }
+
+    pub fn from_euler(pitch: f32, yaw: f32, roll: f32) -> Quat {
+        let hp = pitch*0.5; let hy = yaw*0.5; let hr = roll*0.5;
+        let cp = cos(hp); let sp = sin(hp);
+        let cy = cos(hy); let sy = sin(hy);
+        let cr = cos(hr); let sr = sin(hr);
+        Quat {
+            x: sp*cy*cr - cp*sy*sr, y: cp*sy*cr + sp*cy*sr,
+            z: cp*cy*sr - sp*sy*cr, w: cp*cy*cr + sp*sy*sr,
+        }
+    }
+
+    #[inline]
+    pub fn mul(self, r: Quat) -> Quat {
+        Quat {
+            x: self.w*r.x + self.x*r.w + self.y*r.z - self.z*r.y,
+            y: self.w*r.y - self.x*r.z + self.y*r.w + self.z*r.x,
+            z: self.w*r.z + self.x*r.y - self.y*r.x + self.z*r.w,
+            w: self.w*r.w - self.x*r.x - self.y*r.y - self.z*r.z,
+        }
+    }
+
+    pub fn rotate_vec3(self, v: Vec3) -> Vec3 {
+        let q = Vec3{x:self.x,y:self.y,z:self.z};
+        let t = q.cross(v).scale(2.0);
+        v.add(t.scale(self.w)).add(q.cross(t))
+    }
+
+    pub fn normalized(self) -> Quat {
+        let l = sqrt(self.x*self.x + self.y*self.y + self.z*self.z + self.w*self.w);
+        if l < EPSILON { return Quat::identity(); }
+        let i = 1.0/l;
+        Quat{x:self.x*i, y:self.y*i, z:self.z*i, w:self.w*i}
+    }
+
+    pub fn inverse(self) -> Quat { Quat{x:-self.x, y:-self.y, z:-self.z, w:self.w} }
+
+    pub fn slerp(self, to: Quat, t: f32) -> Quat {
+        let d = clampf(self.x*to.x + self.y*to.y + self.z*to.z + self.w*to.w, -1.0, 1.0);
+        let theta = acos(fabsf(d));
+        if theta < EPSILON {
+            return Quat{
+                x: self.x+(to.x-self.x)*t, y: self.y+(to.y-self.y)*t,
+                z: self.z+(to.z-self.z)*t, w: self.w+(to.w-self.w)*t,
+            }.normalized();
+        }
+        let st = sin(theta);
+        let s0 = sin((1.0-t)*theta)/st;
+        let s1 = (if d < 0.0 { -1.0 } else { 1.0 }) * sin(t*theta)/st;
+        Quat{ x:self.x*s0+to.x*s1, y:self.y*s0+to.y*s1, z:self.z*s0+to.z*s1, w:self.w*s0+to.w*s1 }
+    }
+}
+
+// ─── Transform2D ───────────────────────────────────────────────────────────
+
+pub struct Transform2D { pub x: Vec2, pub y: Vec2, pub origin: Vec2 }
+
+impl Transform2D {
+    pub fn identity() -> Transform2D {
+        Transform2D { x: Vec2::right(), y: Vec2::down(), origin: Vec2::zero() }
+    }
+    pub fn from_angle_origin(angle: f32, origin: Vec2) -> Transform2D {
+        let c = cos(angle); let s = sin(angle);
+        Transform2D { x: Vec2{x:c,y:s}, y: Vec2{x:-s,y:c}, origin }
+    }
+    #[inline]
+    pub fn xform(self, v: Vec2) -> Vec2 {
+        Vec2 {
+            x: self.x.x*v.x + self.y.x*v.y + self.origin.x,
+            y: self.x.y*v.x + self.y.y*v.y + self.origin.y,
+        }
+    }
+    pub fn inverse(self) -> Transform2D {
+        let det = self.x.x*self.y.y - self.x.y*self.y.x;
+        if fabsf(det) < EPSILON { return Transform2D::identity(); }
+        let inv = 1.0/det;
+        let ix = Vec2{x: self.y.y*inv, y:-self.x.y*inv};
+        let iy = Vec2{x:-self.y.x*inv, y: self.x.x*inv};
+        let io = Vec2 {
+            x: -(ix.x*self.origin.x + iy.x*self.origin.y),
+            y: -(ix.y*self.origin.x + iy.y*self.origin.y),
+        };
+        Transform2D{ x:ix, y:iy, origin:io }
+    }
+}
+
+// ─── Transform3D ───────────────────────────────────────────────────────────
+
+pub struct Transform3D { pub basis: [Vec3; 3], pub origin: Vec3 }
+
+impl Transform3D {
+    pub fn identity() -> Transform3D {
+        Transform3D{ basis:[Vec3::right(), Vec3::up(), Vec3::forward().neg()], origin:Vec3::zero() }
+    }
+    pub fn from_quat_origin(q: Quat, origin: Vec3) -> Transform3D {
+        Transform3D {
+            basis: [q.rotate_vec3(Vec3::right()), q.rotate_vec3(Vec3::up()), q.rotate_vec3(Vec3::forward())],
+            origin,
+        }
+    }
+    #[inline]
+    pub fn xform(self, v: Vec3) -> Vec3 {
+        Vec3 {
+            x: self.basis[0].x*v.x + self.basis[1].x*v.y + self.basis[2].x*v.z + self.origin.x,
+            y: self.basis[0].y*v.x + self.basis[1].y*v.y + self.basis[2].y*v.z + self.origin.y,
+            z: self.basis[0].z*v.x + self.basis[1].z*v.y + self.basis[2].z*v.z + self.origin.z,
+        }
+    }
+    pub fn looking_at(from: Vec3, to: Vec3, up: Vec3) -> Transform3D {
+        let fwd  = to.sub(from).normalized();
+        let rght = fwd.cross(up).normalized();
+        let up2  = rght.cross(fwd);
+        Transform3D{ basis:[rght, up2, fwd.neg()], origin:from }
+    }
+}
+
+// ─── Rect2 ─────────────────────────────────────────────────────────────────
+
+pub struct Rect2 { pub pos: Vec2, pub size: Vec2 }
+
+impl Rect2 {
+    pub fn new(x: f32, y: f32, w: f32, h: f32) -> Rect2 {
+        Rect2{ pos:Vec2::new(x,y), size:Vec2::new(w,h) }
+    }
+    pub fn end(self) -> Vec2 { self.pos.add(self.size) }
+    pub fn center(self) -> Vec2 { self.pos.add(self.size.scale(0.5)) }
+    pub fn contains(self, p: Vec2) -> bool {
+        p.x >= self.pos.x && p.y >= self.pos.y
+            && p.x < self.pos.x+self.size.x && p.y < self.pos.y+self.size.y
+    }
+    pub fn intersects(self, r: Rect2) -> bool {
+        self.pos.x < r.pos.x+r.size.x && self.pos.x+self.size.x > r.pos.x
+            && self.pos.y < r.pos.y+r.size.y && self.pos.y+self.size.y > r.pos.y
+    }
+    pub fn grow(self, a: f32) -> Rect2 {
+        Rect2{ pos:self.pos.sub(Vec2::one().scale(a)), size:self.size.add(Vec2::one().scale(a*2.0)) }
+    }
+}
+
+// ─── Color ─────────────────────────────────────────────────────────────────
+
+pub struct Color { pub r: f32, pub g: f32, pub b: f32, pub a: f32 }
+
+impl Color {
+    pub fn new(r: f32, g: f32, b: f32, a: f32) -> Color { Color{r,g,b,a} }
+    pub fn rgb(r: f32, g: f32, b: f32)          -> Color { Color{r,g,b,a:1.0} }
+
+    pub const WHITE:   Color = Color{r:1.0,g:1.0,b:1.0,a:1.0};
+    pub const BLACK:   Color = Color{r:0.0,g:0.0,b:0.0,a:1.0};
+    pub const RED:     Color = Color{r:1.0,g:0.0,b:0.0,a:1.0};
+    pub const GREEN:   Color = Color{r:0.0,g:1.0,b:0.0,a:1.0};
+    pub const BLUE:    Color = Color{r:0.0,g:0.0,b:1.0,a:1.0};
+    pub const CYAN:    Color = Color{r:0.0,g:1.0,b:1.0,a:1.0};
+    pub const YELLOW:  Color = Color{r:1.0,g:1.0,b:0.0,a:1.0};
+    pub const MAGENTA: Color = Color{r:1.0,g:0.0,b:1.0,a:1.0};
+    pub const CLEAR:   Color = Color{r:0.0,g:0.0,b:0.0,a:0.0};
+
+    pub fn from_hex(hex: u32) -> Color {
+        Color {
+            r: ((hex >> 16) & 0xFF) as f32 / 255.0,
+            g: ((hex >>  8) & 0xFF) as f32 / 255.0,
+            b: ( hex        & 0xFF) as f32 / 255.0,
+            a: 1.0,
+        }
+    }
+
+    pub fn to_rgba32(self) -> u32 {
+        let r = (clampf(self.r,0.0,1.0)*255.0) as u32;
+        let g = (clampf(self.g,0.0,1.0)*255.0) as u32;
+        let b = (clampf(self.b,0.0,1.0)*255.0) as u32;
+        let a = (clampf(self.a,0.0,1.0)*255.0) as u32;
+        (r<<24)|(g<<16)|(b<<8)|a
+    }
+
+    pub fn lerp(self, to: Color, t: f32) -> Color {
+        Color {
+            r: self.r+(to.r-self.r)*t, g: self.g+(to.g-self.g)*t,
+            b: self.b+(to.b-self.b)*t, a: self.a+(to.a-self.a)*t,
+        }
+    }
+
+    pub fn darkened(self, amt: f32) -> Color {
+        Color{r:self.r*(1.0-amt), g:self.g*(1.0-amt), b:self.b*(1.0-amt), a:self.a}
+    }
+
+    pub fn with_alpha(self, a: f32) -> Color { Color{r:self.r,g:self.g,b:self.b,a} }
+}

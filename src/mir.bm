@@ -1,0 +1,367 @@
+/// BlackMagic Mid-Level Intermediate Representation (MIR)
+///
+/// MIR is a Control Flow Graph (CFG) in SSA form (Static Single Assignment).
+/// Every local is assigned exactly once. Phi nodes merge values at join points.
+///
+/// Pipeline:  AST  →  HIR (type-checked AST)  →  MIR  →  Optimised MIR  →  Codegen
+///
+/// Design:
+///   - Flat list of BasicBlocks per function
+///   - Three-address instructions: `dest = op(a, b)`
+///   - Explicit terminators: Goto, Branch, Return, Panic, Drop
+///   - Value numbering via `Local(u32)` — unlimited virtual registers
+
+use std::collections::HashMap;
+use crate::types::{TypeId, TypeCtx};
+use crate::error::Span;
+
+// ─── Local (SSA value) ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Local(pub u32);
+
+impl std::fmt::Display for Local {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "_{}", self.0)
+    }
+}
+
+// ─── Constants ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum Const {
+    Int(i128),
+    Float(f64),
+    Bool(bool),
+    Str(String),
+    Char(char),
+    Null,
+    Undefined,
+}
+
+// ─── Operand ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum Operand {
+    Local(Local),
+    Const(Const),
+    /// Function reference by name
+    Func(String),
+    /// Static global
+    Static(String),
+}
+
+// ─── Place (lvalue) ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum MirPlace {
+    Local(Local),
+    Field(Box<MirPlace>, String),
+    Index(Box<MirPlace>, Operand),
+    Deref(Box<MirPlace>),
+}
+
+// ─── Rvalue ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum Rvalue {
+    Use(Operand),
+    BinOp(BinOpKind, Operand, Operand),
+    UnaryOp(UnaryOpKind, Operand),
+    /// &place   (shared)
+    Ref(MirPlace),
+    /// &var place  (mutable)
+    MutRef(MirPlace),
+    /// Move out of place
+    Move(MirPlace),
+    /// Copy (for Copy types)
+    Copy(MirPlace),
+    /// Struct/tuple constructor
+    Aggregate(AggregateKind, Vec<Operand>),
+    /// Discriminant read (for enums)
+    Discriminant(Operand),
+    /// Cast
+    Cast(Operand, TypeId),
+    /// SIMD splat: all lanes = operand
+    SimdSplat(Operand, u32 /* lanes */),
+    /// SIMD binary op on whole vector
+    SimdBinOp(BinOpKind, Operand, Operand),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BinOpKind {
+    Add, Sub, Mul, Div, Rem,
+    Eq, Ne, Lt, Le, Gt, Ge,
+    BitAnd, BitOr, BitXor, Shl, Shr,
+    And, Or,
+}
+
+#[derive(Debug, Clone)]
+pub enum UnaryOpKind {
+    Neg, Not, Deref,
+}
+
+#[derive(Debug, Clone)]
+pub enum AggregateKind {
+    Tuple,
+    Array,
+    Struct(String /* name */),
+    EnumVariant(String /* enum */, String /* variant */, u32 /* tag */),
+}
+
+// ─── Statement ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct MirStmt {
+    pub kind: MirStmtKind,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStmtKind {
+    /// `dest = rvalue`
+    Assign { dest: MirPlace, value: Rvalue },
+    /// Mark local as live (allocate)
+    StorageLive(Local),
+    /// Mark local as dead (free)
+    StorageDead(Local),
+    /// Effect perform: `effect_name::op_name(args) -> dest`
+    Perform { effect: String, op: String, args: Vec<Operand>, dest: Option<Local> },
+    /// Nop (placeholder after optimisation)
+    Nop,
+}
+
+// ─── Terminator ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum Terminator {
+    /// Unconditional jump
+    Goto { target: BlockId },
+    /// Conditional branch
+    Branch { cond: Operand, then: BlockId, else_: BlockId },
+    /// Switch on discriminant
+    Switch { discrim: Operand, arms: Vec<(i128, BlockId)>, default: BlockId },
+    /// Return value (None = void)
+    Return(Option<Operand>),
+    /// Call a function, continue at `then`, pass result to `dest`
+    Call {
+        func:    Operand,
+        args:    Vec<Operand>,
+        dest:    Option<Local>,
+        then:    BlockId,
+        unwind:  Option<BlockId>,
+    },
+    /// Drop a place then continue
+    Drop { place: MirPlace, then: BlockId },
+    /// Unreachable (after type-checked exhaustive match etc.)
+    Unreachable,
+    /// Panic (bounds check, linear-type violation etc.)
+    Panic { msg: String },
+}
+
+// ─── Basic Block ──────────────────────────────────────────────────────────
+
+pub type BlockId = u32;
+
+#[derive(Debug, Clone)]
+pub struct BasicBlock {
+    pub id:         BlockId,
+    pub phis:       Vec<Phi>,
+    pub stmts:      Vec<MirStmt>,
+    pub terminator: Terminator,
+}
+
+/// SSA φ-node: dest = φ(pred₀→val₀, pred₁→val₁, …)
+#[derive(Debug, Clone)]
+pub struct Phi {
+    pub dest:    Local,
+    pub ty:      TypeId,
+    pub entries: Vec<(BlockId, Operand)>,
+}
+
+// ─── Local variable metadata ───────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct LocalDecl {
+    pub ty:       TypeId,
+    pub name:     Option<String>,   // original source name if from `let`
+    pub is_tmp:   bool,
+    pub is_arg:   bool,
+}
+
+// ─── MIR Function ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name:        String,
+    pub locals:      Vec<LocalDecl>,  // index = Local.0
+    pub args:        Vec<Local>,
+    pub return_ty:   TypeId,
+    pub blocks:      Vec<BasicBlock>,
+    pub entry:       BlockId,
+}
+
+impl MirFunction {
+    pub fn new(name: String, return_ty: TypeId) -> Self {
+        MirFunction {
+            name,
+            locals:    Vec::new(),
+            args:      Vec::new(),
+            return_ty,
+            blocks:    Vec::new(),
+            entry:     0,
+        }
+    }
+
+    pub fn new_local(&mut self, ty: TypeId, name: Option<String>, is_tmp: bool, is_arg: bool) -> Local {
+        let id = self.locals.len() as u32;
+        self.locals.push(LocalDecl { ty, name, is_tmp, is_arg });
+        Local(id)
+    }
+
+    pub fn new_block(&mut self) -> BlockId {
+        let id = self.blocks.len() as u32;
+        self.blocks.push(BasicBlock {
+            id,
+            phis:       Vec::new(),
+            stmts:      Vec::new(),
+            terminator: Terminator::Unreachable,
+        });
+        id
+    }
+
+    pub fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock {
+        &mut self.blocks[id as usize]
+    }
+
+    pub fn push_stmt(&mut self, block: BlockId, stmt: MirStmtKind, span: Span) {
+        self.blocks[block as usize].stmts.push(MirStmt { kind: stmt, span });
+    }
+
+    pub fn set_terminator(&mut self, block: BlockId, term: Terminator) {
+        self.blocks[block as usize].terminator = term;
+    }
+}
+
+// ─── MIR Module ───────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub struct MirModule {
+    pub name:      String,
+    pub functions: HashMap<String, MirFunction>,
+    pub statics:   HashMap<String, (TypeId, Const)>,
+    /// Type context: all struct/enum layouts and primitive type info for codegen.
+    pub type_ctx:  TypeCtx,
+}
+
+impl Default for MirModule {
+    fn default() -> Self {
+        MirModule {
+            name:      String::new(),
+            functions: HashMap::new(),
+            statics:   HashMap::new(),
+            type_ctx:  TypeCtx::new(),
+        }
+    }
+}
+
+impl MirModule {
+    pub fn new(name: &str) -> Self {
+        MirModule { name: name.to_string(), ..Default::default() }
+    }
+
+    pub fn add_function(&mut self, f: MirFunction) {
+        self.functions.insert(f.name.clone(), f);
+    }
+}
+
+// ─── MIR Builder ──────────────────────────────────────────────────────────
+/// Lowers typed AST to MIR. Separate from optimisation and codegen.
+
+pub struct MirBuilder {
+    pub module:    MirModule,
+    current_fn:    Option<String>,
+    current_block: BlockId,
+    next_tmp:      u32,
+    var_map:       HashMap<String, Local>,
+}
+
+impl MirBuilder {
+    pub fn new(module_name: &str) -> Self {
+        MirBuilder {
+            module:        MirModule::new(module_name),
+            current_fn:    None,
+            current_block: 0,
+            next_tmp:      0,
+            var_map:       HashMap::new(),
+        }
+    }
+
+    fn cur_fn(&mut self) -> &mut MirFunction {
+        let name = self.current_fn.as_ref().unwrap().clone();
+        self.module.functions.get_mut(&name).unwrap()
+    }
+
+    pub fn begin_function(&mut self, name: &str, return_ty: TypeId) {
+        let f = MirFunction::new(name.to_string(), return_ty);
+        self.module.functions.insert(name.to_string(), f);
+        self.current_fn = Some(name.to_string());
+        let entry = self.cur_fn().new_block();
+        self.cur_fn().entry = entry;
+        self.current_block = entry;
+        self.var_map.clear();
+    }
+
+    pub fn fresh_tmp(&mut self, ty: TypeId) -> Local {
+        let l = self.cur_fn().new_local(ty, None, true, false);
+        self.next_tmp += 1;
+        l
+    }
+
+    pub fn emit(&mut self, kind: MirStmtKind) {
+        let span = Span::default();
+        let block = self.current_block;
+        self.cur_fn().push_stmt(block, kind, span);
+    }
+
+    pub fn terminate(&mut self, term: Terminator) {
+        let block = self.current_block;
+        self.cur_fn().set_terminator(block, term);
+    }
+
+    pub fn new_block(&mut self) -> BlockId {
+        self.cur_fn().new_block()
+    }
+
+    pub fn switch_block(&mut self, id: BlockId) {
+        self.current_block = id;
+    }
+}
+
+// ─── MIR printer (for --emit=mir) ────────────────────────────────────────
+
+impl MirFunction {
+    pub fn pretty_print(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("fn {} {{\n", self.name));
+        for (i, decl) in self.locals.iter().enumerate() {
+            let src = decl.name.as_deref().unwrap_or("<tmp>");
+            out.push_str(&format!("  let _{}: ty#{};  // {}\n", i, decl.ty.0, src));
+        }
+        for block in &self.blocks {
+            out.push_str(&format!("\nbb{}:\n", block.id));
+            for phi in &block.phis {
+                let entries: Vec<String> = phi.entries.iter()
+                    .map(|(b, o)| format!("bb{}: {:?}", b, o))
+                    .collect();
+                out.push_str(&format!("  _{} = φ({})\n", phi.dest.0, entries.join(", ")));
+            }
+            for stmt in &block.stmts {
+                out.push_str(&format!("  {:?}\n", stmt.kind));
+            }
+            out.push_str(&format!("  → {:?}\n", block.terminator));
+        }
+        out.push('}');
+        out
+    }
+}

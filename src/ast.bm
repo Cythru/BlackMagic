@@ -1,0 +1,726 @@
+/// BlackMagic Abstract Syntax Tree
+/// Complete representation of every construct in the language.
+
+use crate::error::Span;
+
+// ─── Identifiers ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Ident {
+    pub name: String,
+    pub span: Span,
+}
+
+/// Qualified path: std::io::println
+#[derive(Debug, Clone)]
+pub struct Path {
+    pub segments: Vec<Ident>,
+    pub span:     Span,
+}
+
+// ─── Visibility ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Visibility {
+    Public,       // pub
+    Package,      // pub(pkg)
+    Module,       // pub(mod)
+    Private,      // (default)
+}
+
+// ─── Attributes ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct Attribute {
+    pub name: String,
+    pub args: Vec<AttrArg>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum AttrArg {
+    Ident(Ident),
+    Literal(Literal),
+    KeyValue { key: Ident, val: Box<AttrArg> },
+    List(Vec<AttrArg>),
+}
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum Type {
+    // Primitives
+    I8, I16, I32, I64, I128, Isize, Int,
+    U8, U16, U32, U64, U128, Usize, Uint,
+    F16, F32, F64, F128,
+    Bool, Char, Str, Void, Never, Byte,
+
+    // Named type (possibly generic)
+    Named { path: Path, generics: Vec<Type> },
+
+    // SIMD vector vec4<f32>
+    Simd { elem: Box<Type>, lanes: u32 },
+
+    // Tensor tensor<f32, [M, N]>
+    Tensor { elem: Box<Type>, dims: Vec<DimExpr> },
+
+    // Reference types
+    Ref { inner: Box<Type>, mutable: bool, lifetime: Option<String> },
+    Owned(Box<Type>),
+    RawPtr { inner: Box<Type>, mutable: bool },
+    WeakRef(Box<Type>),
+
+    // Slice [T]
+    Slice(Box<Type>),
+
+    // Array [T; N]
+    Array { elem: Box<Type>, len: Box<Expr> },
+
+    // Tuple (A, B, C)
+    Tuple(Vec<Type>),
+
+    // Function fn(A, B) -> C
+    Fn {
+        params:  Vec<Type>,
+        ret:     Box<Type>,
+        effects: Vec<Effect>,
+    },
+
+    // Optional ?T
+    Optional(Box<Type>),
+
+    // Effect type: T !E1 + E2
+    WithEffects { inner: Box<Type>, effects: Vec<Effect> },
+
+    // Linear type
+    Linear(Box<Type>),
+
+    // Refinement type: i32 where self > 0
+    Refined { inner: Box<Type>, pred: Box<Expr> },
+
+    // Dependent: Index(n) = usize where self < n
+    Dependent { base: Box<Type>, params: Vec<(Ident, Box<Type>)> },
+
+    // Inferred _
+    Infer,
+
+    // Self type
+    SelfType,
+}
+
+/// Dimension expression in tensor types (may be a const or a value param)
+#[derive(Debug, Clone)]
+pub enum DimExpr {
+    Lit(u64),
+    Var(Ident),
+}
+
+/// Effect in a type or function signature
+#[derive(Debug, Clone)]
+pub struct Effect {
+    pub path:     Path,
+    pub generics: Vec<Type>,
+    pub span:     Span,
+}
+
+// ─── Literals ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum Literal {
+    Int(u128),
+    Float(f64),
+    Str(String),
+    Char(char),
+    Byte(u8),
+    Bool(bool),
+    Null,
+}
+
+// ─── Patterns ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct Pattern {
+    pub kind: PatternKind,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum PatternKind {
+    Wildcard,                                          // _
+    Literal(Literal),                                  // 42, "hi", 'x'
+    Ident { name: Ident, bound: Option<Box<Pattern>> },// x or x @ pat
+    Ref { inner: Box<Pattern>, mutable: bool },        // &pat or &mut pat
+    Tuple(Vec<Pattern>),                               // (a, b, c)
+    Array { elems: Vec<Pattern>, rest: bool },         // [a, b, ..rest]
+    Struct {                                           // Point { x, y: 0 }
+        path:    Path,
+        fields:  Vec<FieldPattern>,
+        rest:    bool,
+    },
+    Enum { path: Path, inner: Option<Box<Pattern>> }, // .Some(x) or .None
+    Range { lo: Box<Pattern>, hi: Box<Pattern>, inclusive: bool }, // 1..=9
+    Or(Vec<Pattern>),                                  // a | b | c
+    Guard { pat: Box<Pattern>, cond: Box<Expr> },      // x if x > 0
+}
+
+#[derive(Debug, Clone)]
+pub struct FieldPattern {
+    pub name:    Ident,
+    pub pattern: Option<Box<Pattern>>,
+    pub span:    Span,
+}
+
+// ─── Expressions ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct Expr {
+    pub kind:  ExprKind,
+    pub span:  Span,
+    pub attrs: Vec<Attribute>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ExprKind {
+    // Literals
+    Lit(Literal),
+
+    // Variable reference
+    Var(Path),
+
+    // Self
+    SelfExpr,
+
+    // Block expression { stmts... expr? }
+    Block(Block),
+
+    // Unary operators
+    Unary { op: UnaryOp, operand: Box<Expr> },
+
+    // Binary operators
+    Binary { op: BinaryOp, lhs: Box<Expr>, rhs: Box<Expr> },
+
+    // Assignment
+    Assign { target: Box<Expr>, op: Option<BinaryOp>, value: Box<Expr> },
+
+    // Function call
+    Call { callee: Box<Expr>, args: Vec<Arg> },
+
+    // Method call (UFCS)
+    MethodCall { receiver: Box<Expr>, method: Ident, generics: Vec<Type>, args: Vec<Arg> },
+
+    // Index expression a[i]
+    Index { base: Box<Expr>, idx: Box<Expr> },
+
+    // Field access a.b
+    Field { base: Box<Expr>, field: Ident },
+
+    // Tuple field a.0
+    TupleField { base: Box<Expr>, idx: u32 },
+
+    // Struct literal Point { x: 1.0, y: 2.0 }
+    StructLit { path: Path, fields: Vec<FieldInit>, rest: Option<Box<Expr>> },
+
+    // Enum variant .Some(x)
+    EnumVariant { path: Path, payload: Option<Box<Expr>> },
+
+    // Tuple (a, b)
+    Tuple(Vec<Expr>),
+
+    // Array [1, 2, 3] or [0; N]
+    Array(ArrayExpr),
+
+    // Closure fn(x) => expr  or  fn(x) { stmts }
+    Closure {
+        params:  Vec<Param>,
+        ret_ty:  Option<Box<Type>>,
+        body:    Box<Expr>,
+        capture: CaptureMode,
+    },
+
+    // If expression
+    If { cond: Box<Expr>, then: Block, else_: Option<Box<Expr>> },
+
+    // Match expression
+    Match { scrutinee: Box<Expr>, arms: Vec<MatchArm> },
+
+    // While loop
+    While { cond: Box<Expr>, body: Block, label: Option<Ident> },
+
+    // For loop
+    For { pat: Pattern, iter: Box<Expr>, body: Block, label: Option<Ident> },
+
+    // Return
+    Return(Option<Box<Expr>>),
+
+    // Break / Continue
+    Break { label: Option<Ident>, value: Option<Box<Expr>> },
+    Continue { label: Option<Ident> },
+
+    // Defer
+    Defer(Box<Expr>),
+
+    // ? operator (error propagation)
+    Try(Box<Expr>),
+
+    // Type cast
+    Cast { expr: Box<Expr>, ty: Box<Type> },
+
+    // Type check (is)
+    TypeCheck { expr: Box<Expr>, ty: Box<Type> },
+
+    // Await
+    Await(Box<Expr>),
+
+    // Spawn (actor)
+    Spawn(Box<Expr>),
+
+    // Handle (effect handler)
+    Handle { computation: Box<Expr>, handlers: Vec<EffectHandler> },
+
+    // Resume (inside handler)
+    Resume(Box<Expr>),
+
+    // Comptime expression
+    Comptime(Box<Expr>),
+
+    // Inline assembly
+    Asm(AsmBlock),
+
+    // Macro invocation println!("...")
+    MacroCall { name: String, tokens: Vec<String> },
+
+    // Range  a..b  or  a..=b
+    Range { lo: Option<Box<Expr>>, hi: Option<Box<Expr>>, inclusive: bool },
+
+    // Ref / MutRef
+    Ref { expr: Box<Expr>, mutable: bool },
+
+    // Dereference
+    Deref(Box<Expr>),
+
+    // Move
+    Move(Box<Expr>),
+
+    // String interpolation is handled inside StrLit
+
+    // Unsafe block
+    Unsafe(Block),
+}
+
+#[derive(Debug, Clone)]
+pub enum UnaryOp { Neg, Not, BitNot, Deref, Wrap }
+
+#[derive(Debug, Clone)]
+pub enum BinaryOp {
+    Add, Sub, Mul, Div, Rem, Pow,
+    BitAnd, BitOr, BitXor, Shl, Shr,
+    And, Or,
+    Eq, Ne, Lt, Le, Gt, Ge,
+}
+
+#[derive(Debug, Clone)]
+pub enum CaptureMode { Auto, Move }
+
+#[derive(Debug, Clone)]
+pub struct Arg {
+    pub label: Option<Ident>,
+    pub expr:  Expr,
+    pub span:  Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct FieldInit {
+    pub name: Ident,
+    pub expr: Option<Expr>,  // None = shorthand `{ x }` = `{ x: x }`
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum ArrayExpr {
+    List(Vec<Expr>),
+    Repeat { elem: Box<Expr>, count: Box<Expr> },
+}
+
+#[derive(Debug, Clone)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub guard:   Option<Expr>,
+    pub body:    Expr,
+    pub span:    Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct EffectHandler {
+    pub effect_op: Path,
+    pub params:    Vec<Param>,
+    pub body:      Block,
+    pub span:      Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct AsmBlock {
+    pub template:  String,
+    pub inputs:    Vec<AsmOperand>,
+    pub outputs:   Vec<AsmOperand>,
+    pub clobbers:  Vec<String>,
+    pub volatile:  bool,
+    pub span:      Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct AsmOperand {
+    pub constraint: String,
+    pub name:       Option<Ident>,
+    pub expr:       Expr,
+    pub span:       Span,
+}
+
+// ─── Statements ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct Block {
+    pub stmts: Vec<Stmt>,
+    pub expr:  Option<Box<Expr>>,  // trailing expression (no semicolon)
+    pub span:  Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct Stmt {
+    pub kind: StmtKind,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum StmtKind {
+    // let x: T = expr
+    Let {
+        pattern:  Pattern,
+        ty:       Option<Type>,
+        init:     Option<Expr>,
+        mutable:  bool,   // var vs let
+    },
+    // const / static
+    Const {
+        name: Ident,
+        ty:   Type,
+        init: Expr,
+    },
+    // An expression used as a statement
+    Expr(Expr),
+    // Local item declaration
+    Item(Box<Item>),
+}
+
+// ─── Items (top-level declarations) ─────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct Item {
+    pub kind:    ItemKind,
+    pub vis:     Visibility,
+    pub attrs:   Vec<Attribute>,
+    pub span:    Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum ItemKind {
+    Module(ModuleDecl),
+    Use(UseDecl),
+    Function(FunctionDecl),
+    Struct(StructDecl),
+    Enum(EnumDecl),
+    Trait(TraitDecl),
+    Impl(ImplDecl),
+    TypeAlias(TypeAlias),
+    Const { name: Ident, ty: Type, val: Expr },
+    Static { name: Ident, ty: Type, val: Expr, mutable: bool },
+    Effect(EffectDecl),
+    Actor(ActorDecl),
+    Interface(InterfaceDecl),
+    MacroDef(MacroDef),
+    Extern(ExternBlock),
+}
+
+// ─── Module ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ModuleDecl {
+    pub name:       Ident,
+    pub params:     Vec<ModuleParam>,   // parametric: module Vec(T: type)
+    pub implements: Vec<Path>,          // implements Container
+    pub where_:     Vec<WherePred>,
+    pub items:      Vec<Item>,
+    pub hot_reload: bool,
+    pub span:       Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModuleParam {
+    pub name:  Ident,
+    pub bound: ModuleParamBound,
+    pub span:  Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum ModuleParamBound {
+    Type,                // T: type
+    Trait(Vec<Path>),    // T: Display + Clone
+    Module(Path),        // M: Container
+    Const(Type),         // N: usize (constant parameter)
+}
+
+// ─── Use / import ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct UseDecl {
+    pub tree: UseTree,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum UseTree {
+    Path { prefix: Path, tree: Box<UseTree> },
+    Name { name: Ident, alias: Option<Ident> },
+    Glob,
+    Group(Vec<UseTree>),
+}
+
+// ─── Function ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct FunctionDecl {
+    pub name:      Ident,
+    pub generics:  Vec<GenericParam>,
+    pub params:    Vec<Param>,
+    pub ret:       Option<Type>,
+    pub effects:   Vec<Effect>,
+    pub where_:    Vec<WherePred>,
+    pub body:      Option<Block>,     // None for extern / trait method
+    pub is_async:  bool,
+    pub is_comptime: bool,
+    pub is_pure:   bool,
+    pub is_total:  bool,
+    pub is_dispatch: bool,
+    pub extern_abi: Option<String>,   // "C", "C++", etc.
+    pub span:      Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct Param {
+    pub name:    Pattern,
+    pub ty:      Type,
+    pub default: Option<Expr>,
+    pub span:    Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct GenericParam {
+    pub name:   Ident,
+    pub bounds: Vec<Path>,
+    pub default: Option<Type>,
+    pub kind:   GenericKind,
+    pub span:   Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum GenericKind {
+    Type,
+    Const(Type),
+    Lifetime,
+}
+
+#[derive(Debug, Clone)]
+pub struct WherePred {
+    pub ty:     Type,
+    pub bounds: Vec<Path>,
+    pub span:   Span,
+}
+
+// ─── Struct ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct StructDecl {
+    pub name:     Ident,
+    pub generics: Vec<GenericParam>,
+    pub fields:   Vec<StructField>,
+    pub kind:     StructKind,
+    pub span:     Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum StructKind {
+    Named,     // struct Foo { a: i32, b: i32 }
+    Tuple,     // struct Foo(i32, i32)
+    Unit,      // struct Foo
+    Linear,    // linear struct Foo { ... }
+    Packed,    // #[packed] struct
+    Soa,       // #[soa] struct
+}
+
+#[derive(Debug, Clone)]
+pub struct StructField {
+    pub name: Ident,
+    pub ty:   Type,
+    pub vis:  Visibility,
+    pub span: Span,
+}
+
+// ─── Enum ────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct EnumDecl {
+    pub name:      Ident,
+    pub generics:  Vec<GenericParam>,
+    pub variants:  Vec<EnumVariant>,
+    pub repr:      Option<Type>,
+    pub span:      Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumVariant {
+    pub name:    Ident,
+    pub payload: VariantPayload,
+    pub discrim: Option<Expr>,
+    pub span:    Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum VariantPayload {
+    Unit,
+    Tuple(Vec<Type>),
+    Struct(Vec<StructField>),
+}
+
+// ─── Trait ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct TraitDecl {
+    pub name:      Ident,
+    pub generics:  Vec<GenericParam>,
+    pub supers:    Vec<Path>,
+    pub assoc:     Vec<AssocItem>,
+    pub where_:    Vec<WherePred>,
+    pub span:      Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum AssocItem {
+    Type { name: Ident, bounds: Vec<Path>, default: Option<Type> },
+    Const { name: Ident, ty: Type, default: Option<Expr> },
+    Method(FunctionDecl),
+}
+
+// ─── Impl ────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ImplDecl {
+    pub generics:  Vec<GenericParam>,
+    pub trait_:    Option<Path>,       // None = inherent impl
+    pub self_ty:   Type,
+    pub where_:    Vec<WherePred>,
+    pub items:     Vec<Item>,
+    pub span:      Span,
+}
+
+// ─── Effect declaration ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct EffectDecl {
+    pub name:     Ident,
+    pub generics: Vec<GenericParam>,
+    pub ops:      Vec<EffectOp>,
+    pub span:     Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct EffectOp {
+    pub name:    Ident,
+    pub params:  Vec<Param>,
+    pub ret:     Type,
+    pub span:    Span,
+}
+
+// ─── Actor declaration ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ActorDecl {
+    pub name:    Ident,
+    pub fields:  Vec<ActorField>,
+    pub receive: ReceiveBlock,
+    pub methods: Vec<FunctionDecl>,
+    pub span:    Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActorField {
+    pub name:    Ident,
+    pub ty:      Type,
+    pub default: Option<Expr>,
+    pub span:    Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReceiveBlock {
+    pub arms: Vec<MatchArm>,
+    pub span: Span,
+}
+
+// ─── Interface (module signature) ────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct InterfaceDecl {
+    pub name:  Ident,
+    pub items: Vec<AssocItem>,
+    pub span:  Span,
+}
+
+// ─── Type alias ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct TypeAlias {
+    pub name:     Ident,
+    pub generics: Vec<GenericParam>,
+    pub ty:       Type,
+    pub where_:   Vec<WherePred>,
+    pub span:     Span,
+}
+
+// ─── Macro definition ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct MacroDef {
+    pub name:  Ident,
+    pub rules: Vec<MacroRule>,
+    pub span:  Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct MacroRule {
+    pub pattern:    Vec<String>,    // simplified
+    pub expansion:  Vec<String>,    // simplified
+    pub span:       Span,
+}
+
+// ─── Extern block ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ExternBlock {
+    pub abi:   String,
+    pub items: Vec<ExternItem>,
+    pub span:  Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum ExternItem {
+    Fn(FunctionDecl),
+    Static { name: Ident, ty: Type, mutable: bool },
+    Type(Ident),
+}
+
+// ─── Source file ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct SourceFile {
+    pub path:  String,
+    pub items: Vec<Item>,
+    pub span:  Span,
+}

@@ -1,0 +1,253 @@
+/// BlackMagic — SIMD, SOA, and Maximum Performance
+/// Shows: SIMD types, SOA layout, inline ASM, GPU kernels, zero-cost everything
+
+module simd_demo
+
+use std::simd::*
+use std::io::println
+
+// ─── SOA (Structure of Arrays) for data-parallel work ────────────────────────
+// Fields stored as separate arrays — enables AVX2/AVX-512 autovectorisation
+
+#[soa]
+struct Particle {
+    x:     f32,
+    y:     f32,
+    z:     f32,
+    vx:    f32,
+    vy:    f32,
+    vz:    f32,
+    mass:  f32,
+    alive: bool,
+}
+
+// ─── SIMD dot product (8-wide f32) ───────────────────────────────────────────
+
+fn dot8(a: vec8<f32>, b: vec8<f32>) -> f32 {
+    (a * b).hadd()   // horizontal add all 8 lanes
+}
+
+fn dot_product_avx(a: &[f32], b: &[f32]) -> f32 {
+    assert!(a.len() == b.len())
+    let n = a.len()
+
+    // Process 8 elements per iteration
+    var acc: vec8<f32> = vec8::zero()
+    var i   = 0usize
+
+    while i + 8 <= n {
+        let va = vec8::<f32>::load(&a[i..])
+        let vb = vec8::<f32>::load(&b[i..])
+        acc = acc + va * vb
+        i += 8
+    }
+
+    var sum: f32 = acc.hadd()
+
+    // Scalar tail
+    while i < n {
+        sum += a[i] * b[i]
+        i += 1
+    }
+    sum
+}
+
+// ─── Fast matrix multiply (cache-blocked + SIMD) ─────────────────────────────
+
+fn matmul_f32(
+    a: &[f32], b: &[f32], c: &mut [f32],
+    m: usize, k: usize, n: usize,
+) {
+    const BLOCK = 64usize   // fits in L1 cache
+
+    for ii in (0..m).step_by(BLOCK) {
+        for jj in (0..n).step_by(BLOCK) {
+            for kk in (0..k).step_by(BLOCK) {
+                let i_end = (ii + BLOCK).min(m)
+                let j_end = (jj + BLOCK).min(n)
+                let k_end = (kk + BLOCK).min(k)
+
+                for i in ii..i_end {
+                    for kk2 in kk..k_end {
+                        let a_val = a[i * k + kk2]
+                        var j     = jj
+
+                        // 8-wide SIMD inner loop
+                        while j + 8 <= j_end {
+                            let vb  = vec8::<f32>::load(&b[kk2 * n + j..])
+                            var vc  = vec8::<f32>::load(&c[i    * n + j..])
+                            vc = vc + vec8::splat(a_val) * vb
+                            vc.store(&mut c[i * n + j..])
+                            j += 8
+                        }
+                        // Scalar tail
+                        while j < j_end {
+                            c[i * n + j] += a_val * b[kk2 * n + j]
+                            j += 1
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ─── N-body simulation (SOA + SIMD) ──────────────────────────────────────────
+
+fn nbody_step(particles: &mut Particle::soa([N]), dt: f32, N: usize) {
+    const G: f32  = 6.674e-11
+    const EPS: f32 = 0.001   // softening
+
+    for i in 0..N {
+        var fx: f32 = 0.0
+        var fy: f32 = 0.0
+        var fz: f32 = 0.0
+
+        // Vectorised inner loop over j in groups of 8
+        var j = 0usize
+        while j + 8 <= N {
+            let dx = vec8::<f32>::load(&particles.x[j..]) - vec8::splat(particles.x[i])
+            let dy = vec8::<f32>::load(&particles.y[j..]) - vec8::splat(particles.y[i])
+            let dz = vec8::<f32>::load(&particles.z[j..]) - vec8::splat(particles.z[i])
+            let m  = vec8::<f32>::load(&particles.mass[j..])
+
+            let r2     = dx*dx + dy*dy + dz*dz + vec8::splat(EPS*EPS)
+            let inv_r  = r2.rsqrt()           // fast reciprocal sqrt
+            let inv_r3 = inv_r * inv_r * inv_r
+            let f      = m * inv_r3 * vec8::splat(G)
+
+            fx += (f * dx).hadd()
+            fy += (f * dy).hadd()
+            fz += (f * dz).hadd()
+
+            j += 8
+        }
+        // Scalar tail
+        while j < N {
+            if j != i {
+                let dx = particles.x[j] - particles.x[i]
+                let dy = particles.y[j] - particles.y[i]
+                let dz = particles.z[j] - particles.z[i]
+                let r2 = dx*dx + dy*dy + dz*dz + EPS*EPS
+                let f  = particles.mass[j] * G / (r2 * r2.sqrt())
+                fx += f * dx
+                fy += f * dy
+                fz += f * dz
+            }
+            j += 1
+        }
+
+        // Integrate (velocity Verlet)
+        let inv_m = 1.0 / particles.mass[i]
+        particles.vx[i] += fx * inv_m * dt
+        particles.vy[i] += fy * inv_m * dt
+        particles.vz[i] += fz * inv_m * dt
+    }
+
+    // Update positions — fully vectorisable, no inter-loop deps
+    var i = 0usize
+    while i + 8 <= N {
+        let vx  = vec8::<f32>::load(&particles.vx[i..])
+        let vy  = vec8::<f32>::load(&particles.vy[i..])
+        let vz  = vec8::<f32>::load(&particles.vz[i..])
+        let vdt = vec8::splat(dt)
+
+        let px = vec8::<f32>::load(&particles.x[i..]) + vx * vdt
+        let py = vec8::<f32>::load(&particles.y[i..]) + vy * vdt
+        let pz = vec8::<f32>::load(&particles.z[i..]) + vz * vdt
+
+        px.store(&mut particles.x[i..])
+        py.store(&mut particles.y[i..])
+        pz.store(&mut particles.z[i..])
+
+        i += 8
+    }
+    // Scalar tail
+    while i < N {
+        particles.x[i] += particles.vx[i] * dt
+        particles.y[i] += particles.vy[i] * dt
+        particles.z[i] += particles.vz[i] * dt
+        i += 1
+    }
+}
+
+// ─── Inline assembly: RDTSC timer ────────────────────────────────────────────
+
+fn rdtsc() -> u64 {
+    asm volatile {
+        "rdtsc; shl rdx, 32; or rax, rdx"
+        out("rax") ret: u64,
+        clobbers("rdx"),
+    }
+    ret
+}
+
+// ─── GPU kernel: parallel prefix sum ─────────────────────────────────────────
+
+#[kernel(threads = [256, 1, 1])]
+fn prefix_sum_kernel(
+    data:   &tensor<f32, [N]> @global,
+    output: &mut tensor<f32, [N]> @global,
+    shared: &mut tensor<f32, [256]> @shared,
+    N:      usize @uniform,
+) {
+    let tid = @thread.x
+    let gid = @block.x * 256 + tid
+
+    // Load into shared memory
+    shared[tid] = if gid < N { data[gid] } else { 0.0 }
+    @barrier()
+
+    // Up-sweep (reduce)
+    var offset = 1usize
+    while offset < 256 {
+        if tid % (offset * 2) == offset * 2 - 1 {
+            shared[tid] += shared[tid - offset]
+        }
+        offset *= 2
+        @barrier()
+    }
+
+    // Down-sweep
+    if tid == 255 { shared[255] = 0.0 }
+    offset = 128usize
+    while offset >= 1 {
+        @barrier()
+        if tid % (offset * 2) == offset * 2 - 1 {
+            let tmp = shared[tid - offset]
+            shared[tid - offset] = shared[tid]
+            shared[tid] += tmp
+        }
+        offset /= 2
+    }
+    @barrier()
+
+    if gid < N { output[gid] = shared[tid] }
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
+
+fn main() !IO {
+    // Dot product benchmark
+    let n = 1_000_000usize
+    let a = [1.0f32; n]
+    let b = [2.0f32; n]
+
+    let t0 = rdtsc()
+    let result = dot_product_avx(&a, &b)
+    let t1 = rdtsc()
+
+    println("dot({n} f32s) = {result}")
+    println("cycles: {}", t1 - t0)
+
+    // N-body
+    var particles: Particle::soa([1024]) = Particle::soa::zeroed(1024)
+    // (init particles here)
+
+    let t2 = rdtsc()
+    for _ in 0..100 {
+        nbody_step(&mut particles, 0.001, 1024)
+    }
+    let t3 = rdtsc()
+    println("100 nbody steps (1024 particles): {} cycles", t3 - t2)
+}

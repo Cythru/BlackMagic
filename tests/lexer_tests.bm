@@ -1,0 +1,283 @@
+/// BlackMagic Compiler — Lexer Tests
+
+#[cfg(test)]
+mod lexer_tests {
+    use blackmagic::lexer::{Lexer, TokenKind};
+
+    fn lex(src: &str) -> Vec<TokenKind> {
+        let (tokens, errors) = Lexer::new(src).tokenise();
+        assert!(errors.is_empty(), "unexpected lex errors: {:?}", errors);
+        tokens.into_iter().map(|t| t.kind).collect()
+    }
+
+    fn lex_first(src: &str) -> TokenKind {
+        lex(src).into_iter().next().unwrap()
+    }
+
+    // ── Integer literals ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_decimal_int() {
+        assert_eq!(lex_first("42"), TokenKind::IntLit(42));
+        assert_eq!(lex_first("0"),  TokenKind::IntLit(0));
+        assert_eq!(lex_first("1_000_000"), TokenKind::IntLit(1_000_000));
+    }
+
+    #[test]
+    fn test_hex_int() {
+        assert_eq!(lex_first("0xFF"),       TokenKind::IntLit(0xFF));
+        assert_eq!(lex_first("0xDEAD_BEEF"),TokenKind::IntLit(0xDEAD_BEEF));
+        assert_eq!(lex_first("0x0"),        TokenKind::IntLit(0));
+    }
+
+    #[test]
+    fn test_octal_int() {
+        assert_eq!(lex_first("0o755"), TokenKind::IntLit(0o755));
+        assert_eq!(lex_first("0o0"),   TokenKind::IntLit(0));
+    }
+
+    #[test]
+    fn test_binary_int() {
+        assert_eq!(lex_first("0b1010"), TokenKind::IntLit(0b1010));
+        assert_eq!(lex_first("0b1111_0000"), TokenKind::IntLit(0b1111_0000));
+    }
+
+    // ── Float literals ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_float() {
+        assert!(matches!(lex_first("3.14"),   TokenKind::FloatLit(_)));
+        assert!(matches!(lex_first("1.0e-9"), TokenKind::FloatLit(_)));
+        assert!(matches!(lex_first("2.5E10"), TokenKind::FloatLit(_)));
+    }
+
+    // ── String literals ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_string() {
+        assert_eq!(lex_first(r#""hello""#), TokenKind::StrLit("hello".into()));
+    }
+
+    #[test]
+    fn test_string_escape() {
+        assert_eq!(
+            lex_first(r#""hello\nworld""#),
+            TokenKind::StrLit("hello\nworld".into())
+        );
+    }
+
+    #[test]
+    fn test_raw_string() {
+        assert_eq!(
+            lex_first(r#"r"no \n escape""#),
+            TokenKind::StrLit(r"no \n escape".into())
+        );
+    }
+
+    // ── Char literals ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_char() {
+        assert_eq!(lex_first("'a'"),  TokenKind::CharLit('a'));
+        assert_eq!(lex_first("'\\n'"), TokenKind::CharLit('\n'));
+        assert_eq!(lex_first("'\\t'"), TokenKind::CharLit('\t'));
+    }
+
+    // ── Bool literals ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_bool() {
+        assert_eq!(lex_first("true"),  TokenKind::BoolLit(true));
+        assert_eq!(lex_first("false"), TokenKind::BoolLit(false));
+    }
+
+    // ── Keywords ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_keywords() {
+        assert_eq!(lex_first("fn"),       TokenKind::KwFn);
+        assert_eq!(lex_first("struct"),   TokenKind::KwStruct);
+        assert_eq!(lex_first("enum"),     TokenKind::KwEnum);
+        assert_eq!(lex_first("trait"),    TokenKind::KwTrait);
+        assert_eq!(lex_first("impl"),     TokenKind::KwImpl);
+        assert_eq!(lex_first("module"),   TokenKind::KwModule);
+        assert_eq!(lex_first("let"),      TokenKind::KwLet);
+        assert_eq!(lex_first("var"),      TokenKind::KwVar);
+        assert_eq!(lex_first("const"),    TokenKind::KwConst);
+        assert_eq!(lex_first("comptime"), TokenKind::KwComptime);
+        assert_eq!(lex_first("if"),       TokenKind::KwIf);
+        assert_eq!(lex_first("else"),     TokenKind::KwElse);
+        assert_eq!(lex_first("match"),    TokenKind::KwMatch);
+        assert_eq!(lex_first("while"),    TokenKind::KwWhile);
+        assert_eq!(lex_first("for"),      TokenKind::KwFor);
+        assert_eq!(lex_first("return"),   TokenKind::KwReturn);
+        assert_eq!(lex_first("defer"),    TokenKind::KwDefer);
+        assert_eq!(lex_first("linear"),   TokenKind::KwLinear);
+        assert_eq!(lex_first("effect"),   TokenKind::KwEffect);
+        assert_eq!(lex_first("actor"),    TokenKind::KwActor);
+        assert_eq!(lex_first("spawn"),    TokenKind::KwSpawn);
+        assert_eq!(lex_first("owned"),    TokenKind::KwOwned);
+        assert_eq!(lex_first("dispatch"), TokenKind::KwDispatch);
+    }
+
+    // ── Primitive type keywords ───────────────────────────────────────────────
+
+    #[test]
+    fn test_type_keywords() {
+        assert_eq!(lex_first("i32"),  TokenKind::KwI32);
+        assert_eq!(lex_first("u64"),  TokenKind::KwU64);
+        assert_eq!(lex_first("f64"),  TokenKind::KwF64);
+        assert_eq!(lex_first("bool"), TokenKind::KwBool);
+        assert_eq!(lex_first("str"),  TokenKind::KwStr);
+        assert_eq!(lex_first("void"), TokenKind::KwVoid);
+    }
+
+    // ── Operators ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_operators() {
+        assert_eq!(lex_first("->"),  TokenKind::Arrow);
+        assert_eq!(lex_first("=>"),  TokenKind::FatArrow);
+        assert_eq!(lex_first("::"),  TokenKind::ColonColon);
+        assert_eq!(lex_first(".."),  TokenKind::DotDot);
+        assert_eq!(lex_first("..."), TokenKind::DotDotDot);
+        assert_eq!(lex_first("..="), TokenKind::DotDotEq);
+        assert_eq!(lex_first("**"),  TokenKind::StarStar);
+        assert_eq!(lex_first("&&"),  TokenKind::AmpAmp);
+        assert_eq!(lex_first("||"),  TokenKind::PipePipe);
+        assert_eq!(lex_first("=="),  TokenKind::EqEq);
+        assert_eq!(lex_first("!="),  TokenKind::BangEq);
+        assert_eq!(lex_first("<="),  TokenKind::LtEq);
+        assert_eq!(lex_first(">="),  TokenKind::GtEq);
+        assert_eq!(lex_first("+="),  TokenKind::PlusEq);
+        assert_eq!(lex_first("-="),  TokenKind::MinusEq);
+        assert_eq!(lex_first("*="),  TokenKind::StarEq);
+        assert_eq!(lex_first("/="),  TokenKind::SlashEq);
+        assert_eq!(lex_first("<<="), TokenKind::LtLtEq);
+        assert_eq!(lex_first(">>="), TokenKind::GtGtEq);
+    }
+
+    // ── Identifiers ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_ident() {
+        assert_eq!(lex_first("foo"),        TokenKind::Ident("foo".into()));
+        assert_eq!(lex_first("_private"),   TokenKind::Ident("_private".into()));
+        assert_eq!(lex_first("CamelCase"),  TokenKind::Ident("CamelCase".into()));
+        assert_eq!(lex_first("snake_case"), TokenKind::Ident("snake_case".into()));
+        assert_eq!(lex_first("x2"),         TokenKind::Ident("x2".into()));
+    }
+
+    // ── Macro calls ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_macro_call() {
+        assert_eq!(lex_first("println!("), TokenKind::MacroCall("println".into()));
+        assert_eq!(lex_first("vec!("),     TokenKind::MacroCall("vec".into()));
+    }
+
+    // ── Comments ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_comment_skipped() {
+        let tokens = lex("// this is a comment\n42");
+        assert_eq!(tokens[0], TokenKind::IntLit(42));
+    }
+
+    #[test]
+    fn test_block_comment_skipped() {
+        let tokens = lex("/* comment */ 42");
+        assert_eq!(tokens[0], TokenKind::IntLit(42));
+    }
+
+    #[test]
+    fn test_nested_block_comment() {
+        let tokens = lex("/* outer /* inner */ still outer */ 42");
+        assert_eq!(tokens[0], TokenKind::IntLit(42));
+    }
+
+    // ── Lifetimes ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_lifetime() {
+        let tokens = lex("'arena");
+        assert_eq!(tokens[0], TokenKind::Lifetime("arena".into()));
+    }
+
+    // ── Attributes ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_attribute() {
+        let tokens = lex("#[derive(Debug, Clone)]");
+        assert!(matches!(tokens[0], TokenKind::Attribute(_)));
+    }
+
+    // ── Full token sequences ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_function_signature() {
+        let src = "fn add(a: i32, b: i32) -> i32";
+        let kinds = lex(src);
+        assert_eq!(kinds[0], TokenKind::KwFn);
+        assert_eq!(kinds[1], TokenKind::Ident("add".into()));
+        assert_eq!(kinds[2], TokenKind::LParen);
+        assert_eq!(kinds[3], TokenKind::Ident("a".into()));
+        assert_eq!(kinds[4], TokenKind::Colon);
+        assert_eq!(kinds[5], TokenKind::KwI32);
+    }
+
+    #[test]
+    fn test_struct_decl() {
+        let src = "struct Point { x: f64, y: f64 }";
+        let kinds = lex(src);
+        assert_eq!(kinds[0], TokenKind::KwStruct);
+        assert_eq!(kinds[1], TokenKind::Ident("Point".into()));
+        assert_eq!(kinds[2], TokenKind::LBrace);
+    }
+
+    #[test]
+    fn test_effect_annotation() {
+        let src = "fn read() -> str !IO + Rand";
+        let kinds = lex(src);
+        // fn read ( ) -> str ! IO + Rand EOF
+        assert!(kinds.contains(&TokenKind::Bang));
+        assert!(kinds.contains(&TokenKind::Ident("IO".into())));
+        assert!(kinds.contains(&TokenKind::Plus));
+        assert!(kinds.contains(&TokenKind::Ident("Rand".into())));
+    }
+
+    #[test]
+    fn test_complex_expression() {
+        let src = "x * x + y ** 2 >= threshold && enabled";
+        let kinds = lex(src);
+        assert!(kinds.contains(&TokenKind::StarStar));
+        assert!(kinds.contains(&TokenKind::GtEq));
+        assert!(kinds.contains(&TokenKind::AmpAmp));
+    }
+
+    // ── Error cases ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_unterminated_string_error() {
+        let (_, errors) = Lexer::new("\"unterminated").tokenise();
+        assert!(!errors.is_empty());
+        assert!(format!("{:?}", errors[0]).contains("UnterminatedString"));
+    }
+
+    #[test]
+    fn test_invalid_escape() {
+        let (_, errors) = Lexer::new("\"\\q\"").tokenise();
+        assert!(!errors.is_empty());
+    }
+
+    // ── Position tracking ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_multiline_positions() {
+        let src = "let\nfoo\nbar";
+        let (tokens, _) = Lexer::new(src).tokenise();
+        assert_eq!(tokens[0].span.start.line, 1);
+        assert_eq!(tokens[1].span.start.line, 2);
+        assert_eq!(tokens[2].span.start.line, 3);
+    }
+}

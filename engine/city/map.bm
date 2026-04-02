@@ -1,0 +1,217 @@
+/// BlackMagic Engine — city/map.bm
+///
+/// Oracle City map definition.
+/// Tile-based city layout parsed from an ASCII blueprint.
+/// Buildings have types, metadata, and live game data callbacks.
+
+use engine::core::math::{ Vec2, Color };
+use engine::renderer::raycast::{ RaycastMap, MapCell };
+use bm::collections::{ Vec as BmVec, HashMap };
+
+// ─── BuildingKind ─────────────────────────────────────────────────────────
+
+pub enum BuildingKind {
+    StockExchange,   // S — live stock data
+    HackerDen,       // H — hacking targets
+    GangHQ,          // G — gang status
+    CorpTower,       // C — corporation
+    AugClinic,       // A — augmentations
+    Bank,            // B — money / loans
+    TrainingCenter,  // T — skill training
+    TravelAgency,    // X — city travel
+    Apartment,       // @ — player home
+    Street,          // . — walkable empty
+    Wall,            // # — solid wall
+    Alley,           // _ — narrow walkable
+}
+
+impl BuildingKind {
+    pub fn from_char(c: u8) -> BuildingKind {
+        match c {
+            83 => BuildingKind::StockExchange,
+            72 => BuildingKind::HackerDen,
+            71 => BuildingKind::GangHQ,
+            67 => BuildingKind::CorpTower,
+            65 => BuildingKind::AugClinic,
+            66 => BuildingKind::Bank,
+            84 => BuildingKind::TrainingCenter,
+            88 => BuildingKind::TravelAgency,
+            64 => BuildingKind::Apartment,
+            95 => BuildingKind::Alley,
+            35 => BuildingKind::Wall,
+            _   => BuildingKind::Street,
+        }
+    }
+
+    pub fn label(self: &BuildingKind) -> str {
+        match self {
+            BuildingKind::StockExchange  => "Stock Exchange",
+            BuildingKind::HackerDen      => "Hacker Den",
+            BuildingKind::GangHQ         => "Gang HQ",
+            BuildingKind::CorpTower      => "Corp Tower",
+            BuildingKind::AugClinic      => "Aug Clinic",
+            BuildingKind::Bank           => "City Bank",
+            BuildingKind::TrainingCenter => "Training Center",
+            BuildingKind::TravelAgency   => "Travel Agency",
+            BuildingKind::Apartment      => "Your Apartment",
+            BuildingKind::Street         => "",
+            BuildingKind::Alley          => "",
+            BuildingKind::Wall           => "",
+        }
+    }
+
+    pub fn wall_color(self: &BuildingKind) -> Color {
+        match self {
+            BuildingKind::StockExchange  => Color::from_hex(0x00BFFF),  // deep sky blue
+            BuildingKind::HackerDen      => Color::from_hex(0x39FF14),  // neon green
+            BuildingKind::GangHQ         => Color::from_hex(0xFF4500),  // orange-red
+            BuildingKind::CorpTower      => Color::from_hex(0xC0C0C0),  // silver
+            BuildingKind::AugClinic      => Color::from_hex(0xFF1493),  // deep pink
+            BuildingKind::Bank           => Color::from_hex(0xFFD700),  // gold
+            BuildingKind::TrainingCenter => Color::from_hex(0xFF8C00),  // dark orange
+            BuildingKind::TravelAgency   => Color::from_hex(0x9370DB),  // medium purple
+            BuildingKind::Apartment      => Color::from_hex(0x4169E1),  // royal blue
+            _                            => Color::rgb(0.5, 0.45, 0.4),
+        }
+    }
+
+    pub fn is_solid(self: &BuildingKind) -> bool {
+        match self {
+            BuildingKind::Wall           => true,
+            BuildingKind::StockExchange  => true,
+            BuildingKind::HackerDen      => true,
+            BuildingKind::GangHQ         => true,
+            BuildingKind::CorpTower      => true,
+            BuildingKind::AugClinic      => true,
+            BuildingKind::Bank           => true,
+            BuildingKind::TrainingCenter => true,
+            BuildingKind::TravelAgency   => true,
+            BuildingKind::Apartment      => true,
+            _                            => false,
+        }
+    }
+
+    pub fn is_enterable(self: &BuildingKind) -> bool {
+        match self {
+            BuildingKind::Wall | BuildingKind::Street | BuildingKind::Alley => false,
+            _ => true,
+        }
+    }
+}
+
+// ─── CityTile ─────────────────────────────────────────────────────────────
+
+pub struct CityTile {
+    pub kind:       BuildingKind,
+    pub texture_id: u8,
+    pub height:     f32,   // visual height multiplier [0.5, 3.0]
+    pub light:      f32,   // ambient light factor [0, 1]
+}
+
+// ─── Oracle City blueprint ────────────────────────────────────────────────
+//
+//   32×24 tile grid. Each character = 1 tile (1 world unit).
+//   Player spawns at 'P' (replaced by '.' at runtime).
+
+const ORACLE_CITY_BLUEPRINT: str = "#################################..............................##..S..S..S...HHH...HHH..S..S..##..S..S..S...HHH...HHH..S..S..##..............................##.....CCCC...CCCC...CCCC.......##.....CCCC...CCCC...CCCC.......##.....CCCC...CCCC...CCCC.......##..............................##...GGG...AAAAAA...GGG.........##...GGG...AAAAAA...GGG.........##...GGG...AAAAAA...GGG.........##..............................##......P.....................@.##..............................##..BBB...TTTTTT...BBB..........##..BBB...TTTTTT...BBB..........##..BBB...TTTTTT...BBB..........##..............................##...........XXX.XX.............##...........XXX.XX.............##..............................##..............................#################################";
+
+const MAP_W: u32 = 32;
+const MAP_H: u32 = 24;
+
+// ─── CityMap ──────────────────────────────────────────────────────────────
+
+pub struct CityMap {
+    pub tiles:   BmVec<CityTile>,
+    pub width:   u32,
+    pub height:  u32,
+    pub start_pos:   Vec2,
+    // Flat MapCell array for the raycaster (derived from tiles)
+    _ray_cells: BmVec<MapCell>,
+}
+
+impl CityMap {
+    pub fn build() -> CityMap {
+        let w = MAP_W;
+        let h = MAP_H;
+        let bp = ORACLE_CITY_BLUEPRINT;
+
+        var tiles: BmVec<CityTile>   = BmVec::new();
+        var ray_cells: BmVec<MapCell> = BmVec::new();
+        var start_pos = Vec2::new(2.0, 2.0);
+
+        var i: usize = 0;
+        while i < (w * h) as usize {
+            let ch = if i < bp.len() { bp.byte_at(i) } else { 46 };
+            let kind = if ch == 80 {
+                // Spawn tile
+                let tx = (i as u32 % w) as f32 + 0.5;
+                let ty = (i as u32 / w) as f32 + 0.5;
+                start_pos = Vec2::new(tx, ty);
+                BuildingKind::Street
+            } else {
+                BuildingKind::from_char(ch)
+            };
+
+            let tex_id: u8 = match &kind {
+                BuildingKind::StockExchange  => 1,
+                BuildingKind::HackerDen      => 2,
+                BuildingKind::GangHQ         => 3,
+                BuildingKind::CorpTower      => 4,
+                BuildingKind::AugClinic      => 5,
+                BuildingKind::Bank           => 6,
+                BuildingKind::TrainingCenter => 7,
+                BuildingKind::TravelAgency   => 8,
+                BuildingKind::Apartment      => 9,
+                BuildingKind::Wall           => 0,
+                _                            => 255,
+            };
+
+            let height: f32 = match &kind {
+                BuildingKind::CorpTower      => 3.0,
+                BuildingKind::StockExchange  => 2.5,
+                BuildingKind::GangHQ         => 2.0,
+                BuildingKind::AugClinic      => 1.8,
+                BuildingKind::Bank           => 1.5,
+                BuildingKind::Wall           => 1.0,
+                _                            => 1.2,
+            };
+
+            let ray_cell = if kind.is_solid() {
+                MapCell::Wall { texture_id: tex_id }
+            } else {
+                MapCell::Empty
+            };
+
+            tiles.push(CityTile { kind, texture_id: tex_id, height, light: 1.0 });
+            ray_cells.push(ray_cell);
+            i += 1;
+        }
+
+        CityMap { tiles, width: w, height: h, start_pos, _ray_cells: ray_cells }
+    }
+
+    pub fn as_raycast_map(self: &CityMap) -> RaycastMap {
+        RaycastMap {
+            cells:  self._ray_cells.as_ptr(),
+            width:  self.width,
+            height: self.height,
+        }
+    }
+
+    #[inline]
+    pub fn tile_at(self: &CityMap, tx: u32, ty: u32) -> &CityTile {
+        &self.tiles[(ty * self.width + tx) as usize]
+    }
+
+    pub fn building_at(self: &CityMap, world_pos: Vec2) -> Option<&BuildingKind> {
+        let tx = world_pos.x as u32;
+        let ty = world_pos.y as u32;
+        if tx < self.width && ty < self.height {
+            let tile = self.tile_at(tx, ty);
+            if tile.kind.is_enterable() { return ?&tile.kind; }
+        }
+        None
+    }
+
+    pub fn tile_count(self: &CityMap) -> usize { self.tiles.len() }
+}

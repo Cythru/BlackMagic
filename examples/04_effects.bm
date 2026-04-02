@@ -1,0 +1,160 @@
+/// BlackMagic — Algebraic Effect System
+/// Shows: effect definitions, effect polymorphism, handlers, composition
+
+module effects_demo
+
+use std::io::{println, eprintln}
+
+// ─── Effect definitions ───────────────────────────────────────────────────────
+
+effect IO {
+    fn stdin_read(n: usize) -> [u8]
+    fn stdout_write(data: &[u8]) -> usize
+    fn stderr_write(data: &[u8]) -> usize
+}
+
+effect Rand {
+    fn next_u64() -> u64
+    fn next_f64() -> f64
+    fn next_bytes(buf: &mut [u8]) -> ()
+}
+
+effect Log {
+    fn log(level: LogLevel, msg: str) -> ()
+}
+
+enum LogLevel { Trace, Debug, Info, Warn, Error }
+
+effect Fail<E> {
+    fn fail(err: E) -> never
+}
+
+effect State<S> {
+    fn get() -> S
+    fn put(s: S) -> ()
+    fn modify(f: fn(S) -> S) -> ()
+}
+
+effect Async {
+    fn yield_now() -> ()
+    fn sleep_ms(ms: u64) -> ()
+}
+
+// ─── Effect polymorphism ─────────────────────────────────────────────────────
+
+/// map_result is polymorphic over effect E — transparent composition
+fn map_result<T, U, E>(
+    items: &[T],
+    f: fn(&T) -> Result<U, str> !E,
+) -> Result<Vec<U>, str> !E {
+    var out = Vec::new()
+    for item in items {
+        out.push(f(item)?)
+    }
+    Ok(out)
+}
+
+// ─── Monte Carlo π estimation ────────────────────────────────────────────────
+
+fn monte_carlo_pi(samples: u64) -> f64 !Rand + Log {
+    var inside: u64 = 0
+    for i in 0..samples {
+        let x = Rand::next_f64()
+        let y = Rand::next_f64()
+        if x * x + y * y <= 1.0 {
+            inside += 1
+        }
+        if i % 100_000 == 0 {
+            Log::log(.Debug, "progress: {i}/{samples}")
+        }
+    }
+    let pi = 4.0 * (inside as f64) / (samples as f64)
+    Log::log(.Info, "π ≈ {pi:.6}")
+    pi
+}
+
+// ─── Stateful counter using State effect ─────────────────────────────────────
+
+fn count_evens(nums: &[i32]) -> u32 !State<u32> {
+    for &n in nums {
+        if n % 2 == 0 {
+            State::modify(fn(c) c + 1)
+        }
+    }
+    State::get()
+}
+
+// ─── Handlers ────────────────────────────────────────────────────────────────
+
+// A simple xorshift64 PRNG for testing
+fn xorshift64(seed: &mut u64) -> u64 {
+    var s = *seed
+    s = s ^ (s << 13)
+    s = s ^ (s >> 7)
+    s = s ^ (s << 17)
+    *seed = s
+    s
+}
+
+fn main() !IO {
+    // ── Handler for Monte Carlo (Rand + Log) ──────────────────────────────
+    var prng_seed: u64 = 0xDEADBEEF_12345678u64
+
+    let pi = handle monte_carlo_pi(1_000_000) with {
+        // Handle Rand effect using our PRNG
+        Rand::next_u64() => {
+            let val = xorshift64(&mut prng_seed)
+            resume(val)
+        },
+        Rand::next_f64() => {
+            let val = (xorshift64(&mut prng_seed) as f64) / (u64::MAX as f64)
+            resume(val)
+        },
+        Rand::next_bytes(buf) => {
+            for b in buf {
+                *b = (xorshift64(&mut prng_seed) & 0xFF) as u8
+            }
+            resume(())
+        },
+
+        // Handle Log effect: print to stderr
+        Log::log(level, msg) => {
+            match level {
+                .Error | .Warn => eprintln("[{level:?}] {msg}"),
+                .Info          => println("[INFO] {msg}"),
+                _              => {}  // suppress Trace/Debug
+            }
+            resume(())
+        },
+    }
+
+    println("Monte Carlo π ≈ {pi:.6}")
+
+    // ── Handler for State effect ──────────────────────────────────────────
+    let nums = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+    // Run count_evens with a mutable reference as state
+    var state: u32 = 0
+    let even_count = handle count_evens(&nums) with {
+        State::get()    => resume(state),
+        State::put(s)   => { state = s; resume(()) },
+        State::modify(f)=> { state = f(state); resume(()) },
+    }
+
+    println("evens in [1..10]: {even_count}")  // 5
+
+    // ── Fail effect → Result conversion ──────────────────────────────────
+    fn safe_divide(a: i32, b: i32) -> i32 !Fail<str> {
+        if b == 0 { Fail::fail("division by zero") }
+        a / b
+    }
+
+    let result: Result<i32, str> = catch {
+        safe_divide(10, 0)
+    }
+
+    match result {
+        .Ok(v)    => println("result = {v}"),
+        .Err(msg) => println("error: {msg}"),  // "error: division by zero"
+    }
+}

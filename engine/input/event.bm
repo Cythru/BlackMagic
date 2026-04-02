@@ -1,0 +1,268 @@
+/// BlackMagic Engine — input/event.bm
+///
+/// Input system — pure BlackMagic. No OS calls here; the platform layer
+/// injects raw events into InputQueue; this module provides the typed
+/// event hierarchy and InputMap (action → binding).
+///
+/// Event hierarchy (Godot-inspired):
+///   InputEvent
+///     InputEventKey
+///     InputEventMouseButton
+///     InputEventMouseMotion
+///     InputEventJoyAxis
+///     InputEventJoyButton
+
+use engine::core::math::{ Vec2 };
+use bm::collections::{ Vec as BmVec, HashMap };
+
+// ─── Keycodes ─────────────────────────────────────────────────────────────
+
+pub enum Key {
+    // Printable ASCII range (use u8 directly for 32–126)
+    Ascii(u8),
+    // Special keys
+    Enter, Escape, Tab, Backspace, Space, Delete, Insert,
+    Left, Right, Up, Down,
+    Home, End, PageUp, PageDown,
+    F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
+    LShift, RShift, LCtrl, RCtrl, LAlt, RAlt,
+    LSuper, RSuper,
+    CapsLock, NumLock, ScrollLock,
+    // Numpad
+    Kp0, Kp1, Kp2, Kp3, Kp4, Kp5, Kp6, Kp7, Kp8, Kp9,
+    KpAdd, KpSub, KpMul, KpDiv, KpEnter, KpPeriod,
+    Unknown,
+}
+
+impl Key {
+    pub fn from_ascii(c: u8) -> Key {
+        if c >= 32 && c <= 126 { Key::Ascii(c) } else { Key::Unknown }
+    }
+}
+
+// ─── MouseButton ──────────────────────────────────────────────────────────
+
+pub enum MouseButton { Left, Right, Middle, WheelUp, WheelDown, X1, X2 }
+
+// ─── Modifier flags ───────────────────────────────────────────────────────
+
+pub const MOD_SHIFT: u8 = 1 << 0;
+pub const MOD_CTRL:  u8 = 1 << 1;
+pub const MOD_ALT:   u8 = 1 << 2;
+pub const MOD_SUPER: u8 = 1 << 3;
+
+// ─── InputEvent ───────────────────────────────────────────────────────────
+
+pub enum InputEvent {
+    Key {
+        key:      Key,
+        pressed:  bool,   // true = keydown, false = keyup
+        repeat:   bool,   // held-down auto-repeat
+        mods:     u8,
+    },
+    MouseButton {
+        button:   MouseButton,
+        pressed:  bool,
+        pos:      Vec2,
+        mods:     u8,
+    },
+    MouseMotion {
+        pos:      Vec2,    // current absolute position
+        relative: Vec2,    // delta since last event
+        buttons:  u8,      // bitmask of held buttons
+    },
+    MouseWheel {
+        delta:    Vec2,    // x=horiz, y=vert scroll
+    },
+    JoyAxis {
+        device:  u8,
+        axis:    u8,
+        value:   f32,      // [-1, 1]
+    },
+    JoyButton {
+        device:  u8,
+        button:  u8,
+        pressed: bool,
+    },
+    TextInput {
+        codepoint: u32,
+    },
+    WindowResize {
+        width:  u32,
+        height: u32,
+    },
+    WindowClose,
+    WindowFocus { focused: bool },
+}
+
+// ─── InputQueue ───────────────────────────────────────────────────────────
+
+/// FIFO queue for raw platform events.
+/// Platform pushes events here; game polls at start of frame.
+pub struct InputQueue {
+    events: BmVec<InputEvent>,
+    read_pos: usize,
+}
+
+impl InputQueue {
+    pub fn new() -> InputQueue {
+        InputQueue { events: BmVec::new(), read_pos: 0 }
+    }
+
+    pub fn push(self: &var InputQueue, ev: InputEvent) {
+        self.events.push(ev);
+    }
+
+    pub fn poll(self: &var InputQueue) -> Option<&InputEvent> {
+        if self.read_pos < self.events.len() {
+            let ev = &self.events[self.read_pos];
+            self.read_pos += 1;
+            ?ev
+        } else {
+            None
+        }
+    }
+
+    /// Call at end of frame to recycle consumed events.
+    pub fn flush(self: &var InputQueue) {
+        self.events.clear();
+        self.read_pos = 0;
+    }
+
+    pub fn pending(self: &InputQueue) -> usize {
+        self.events.len() - self.read_pos
+    }
+}
+
+// ─── InputState ───────────────────────────────────────────────────────────
+
+/// Snapshot of held keys and mouse state.
+/// Updated each frame by consuming InputQueue.
+pub struct InputState {
+    // Key state: indexed by Key enum ordinal (simplified — fixed array for common keys)
+    keys_held: [bool; 256],  // for ASCII keys
+    mouse_pos: Vec2,
+    mouse_buttons: u8,
+    mouse_delta: Vec2,
+}
+
+impl InputState {
+    pub fn new() -> InputState {
+        InputState {
+            keys_held:     [false; 256],
+            mouse_pos:     Vec2::zero(),
+            mouse_buttons: 0,
+            mouse_delta:   Vec2::zero(),
+        }
+    }
+
+    pub fn update(self: &var InputState, queue: &var InputQueue) {
+        self.mouse_delta = Vec2::zero();
+        loop {
+            match queue.poll() {
+                None => break,
+                Some(ev) => match *ev {
+                    InputEvent::Key { key: Key::Ascii(c), pressed, .. } => {
+                        let idx = c as usize;
+                        if idx < 256 { self.keys_held[idx] = pressed; }
+                    }
+                    InputEvent::MouseMotion { pos, relative, .. } => {
+                        self.mouse_pos    = pos;
+                        self.mouse_delta  = self.mouse_delta.add(relative);
+                    }
+                    InputEvent::MouseButton { button, pressed, pos, .. } => {
+                        let bit: u8 = match button {
+                            MouseButton::Left   => 1,
+                            MouseButton::Right  => 2,
+                            MouseButton::Middle => 4,
+                            _ => 0,
+                        };
+                        if pressed { self.mouse_buttons |= bit; }
+                        else       { self.mouse_buttons &= !bit; }
+                        self.mouse_pos = pos;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    pub fn is_key_held(self: &InputState, c: u8) -> bool {
+        if (c as usize) < 256 { self.keys_held[c as usize] } else { false }
+    }
+
+    pub fn is_mouse_held(self: &InputState, button: MouseButton) -> bool {
+        let bit: u8 = match button {
+            MouseButton::Left   => 1,
+            MouseButton::Right  => 2,
+            MouseButton::Middle => 4,
+            _ => 0,
+        };
+        self.mouse_buttons & bit != 0
+    }
+
+    pub fn mouse_pos(self: &InputState)   -> Vec2 { self.mouse_pos }
+    pub fn mouse_delta(self: &InputState) -> Vec2 { self.mouse_delta }
+}
+
+// ─── InputMap ─────────────────────────────────────────────────────────────
+
+/// Named action → set of bindings.
+pub struct InputAction {
+    pub name:     str,
+    pub bindings: BmVec<InputEvent>,
+    pub deadzone: f32,   // for axis bindings
+}
+
+pub struct InputMap {
+    actions: HashMap<str, InputAction>,
+}
+
+impl InputMap {
+    pub fn new() -> InputMap { InputMap { actions: HashMap::new() } }
+
+    pub fn add_action(self: &var InputMap, name: str) {
+        self.actions.insert(name, InputAction {
+            name,
+            bindings: BmVec::new(),
+            deadzone: 0.2,
+        });
+    }
+
+    pub fn add_binding(self: &var InputMap, action: str, binding: InputEvent) {
+        match self.actions.get_mut(action) {
+            Some(act) => { act.bindings.push(binding); }
+            None => {}
+        }
+    }
+
+    pub fn has_action(self: &InputMap, action: str) -> bool {
+        self.actions.contains_key(action)
+    }
+
+    /// Register default WASD + mouse bindings for FPS movement.
+    pub fn register_fps_defaults(self: &var InputMap) {
+        self.add_action("move_forward");
+        self.add_action("move_back");
+        self.add_action("move_left");
+        self.add_action("move_right");
+        self.add_action("interact");
+        self.add_action("map_toggle");
+        self.add_action("exit");
+
+        self.add_binding("move_forward", InputEvent::Key{
+            key:Key::Ascii(119), pressed:true, repeat:true, mods:0});
+        self.add_binding("move_back", InputEvent::Key{
+            key:Key::Ascii(115), pressed:true, repeat:true, mods:0});
+        self.add_binding("move_left", InputEvent::Key{
+            key:Key::Ascii(97), pressed:true, repeat:true, mods:0});
+        self.add_binding("move_right", InputEvent::Key{
+            key:Key::Ascii(100), pressed:true, repeat:true, mods:0});
+        self.add_binding("interact", InputEvent::Key{
+            key:Key::Ascii(101), pressed:true, repeat:false, mods:0});
+        self.add_binding("map_toggle", InputEvent::Key{
+            key:Key::Tab, pressed:true, repeat:false, mods:0});
+        self.add_binding("exit", InputEvent::Key{
+            key:Key::Escape, pressed:true, repeat:false, mods:0});
+    }
+}

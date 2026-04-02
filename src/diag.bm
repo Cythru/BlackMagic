@@ -1,0 +1,370 @@
+/// BlackMagic Rich Diagnostics
+///
+/// Produces beautiful, coloured error messages with source excerpts and
+/// inline annotations — inspired by Rust's diagnostics but tuned for BlackMagic.
+///
+/// Output formats:
+///   - Terminal (ANSI colour codes)
+///   - JSON (for IDE language-server integration)
+///   - Plain text (for CI without colour)
+
+use std::fmt::Write as FmtWrite;
+use crate::error::{BmError, Span, Pos};
+
+// ─── Severity ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    Hint,
+    Warning,
+    Error,
+    Fatal,
+}
+
+impl Severity {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Severity::Hint    => "hint",
+            Severity::Warning => "warning",
+            Severity::Error   => "error",
+            Severity::Fatal   => "fatal error",
+        }
+    }
+    pub fn ansi(&self) -> &'static str {
+        match self {
+            Severity::Hint    => "\x1b[36m",  // cyan
+            Severity::Warning => "\x1b[33m",  // yellow
+            Severity::Error   => "\x1b[31m",  // red
+            Severity::Fatal   => "\x1b[35m",  // magenta
+        }
+    }
+}
+
+// ─── Annotation ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct Annotation {
+    pub span:    Span,
+    pub label:   String,
+    pub primary: bool,
+}
+
+// ─── Diagnostic ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct Diagnostic {
+    pub severity:    Severity,
+    pub code:        Option<String>,
+    pub message:     String,
+    pub annotations: Vec<Annotation>,
+    pub notes:       Vec<String>,
+    pub help:        Option<String>,
+}
+
+impl Diagnostic {
+    pub fn error(msg: impl Into<String>) -> Self {
+        Diagnostic {
+            severity:    Severity::Error,
+            code:        None,
+            message:     msg.into(),
+            annotations: Vec::new(),
+            notes:       Vec::new(),
+            help:        None,
+        }
+    }
+
+    pub fn warning(msg: impl Into<String>) -> Self {
+        Diagnostic { severity: Severity::Warning, ..Self::error(msg) }
+    }
+
+    pub fn hint(msg: impl Into<String>) -> Self {
+        Diagnostic { severity: Severity::Hint, ..Self::error(msg) }
+    }
+
+    pub fn with_code(mut self, code: &str) -> Self {
+        self.code = Some(code.to_string()); self
+    }
+
+    pub fn with_annotation(mut self, span: Span, label: impl Into<String>, primary: bool) -> Self {
+        self.annotations.push(Annotation { span, label: label.into(), primary });
+        self
+    }
+
+    pub fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.notes.push(note.into()); self
+    }
+
+    pub fn with_help(mut self, help: impl Into<String>) -> Self {
+        self.help = Some(help.into()); self
+    }
+}
+
+// ─── BmError → Diagnostic ─────────────────────────────────────────────────
+
+pub fn bmerror_to_diag(err: &BmError) -> Diagnostic {
+    match err {
+        // ── Lexer errors ──────────────────────────────────────────────────
+        BmError::UnexpectedChar { ch, pos } => {
+            let span = Span::new(*pos, *pos);
+            Diagnostic::error(format!("unexpected character '{}'", ch))
+                .with_code("E0001").with_annotation(span, "unexpected character", true)
+        }
+        BmError::UnterminatedString { start } => {
+            let span = Span::new(*start, *start);
+            Diagnostic::error("unterminated string literal")
+                .with_code("E0002").with_annotation(span, "string starts here", true)
+        }
+        BmError::InvalidEscape { ch, pos } => {
+            let span = Span::new(*pos, *pos);
+            Diagnostic::error(format!("invalid escape sequence '\\{}'", ch))
+                .with_code("E0003").with_annotation(span, "invalid escape", true)
+        }
+        BmError::UnterminatedComment { start } => {
+            let span = Span::new(*start, *start);
+            Diagnostic::error("unterminated block comment")
+                .with_code("E0004").with_annotation(span, "comment starts here", true)
+        }
+        BmError::InvalidIntLiteral { span, msg } | BmError::InvalidFloatLiteral { span, msg } => {
+            Diagnostic::error(msg.clone()).with_code("E0005").with_annotation(*span, "here", true)
+        }
+        BmError::OverflowLiteral { span, ty } => {
+            Diagnostic::error(format!("literal overflows type {}", ty))
+                .with_code("E0006").with_annotation(*span, "overflow here", true)
+        }
+        BmError::InvalidUnicodeEscape { span } => {
+            Diagnostic::error("invalid unicode escape")
+                .with_code("E0007").with_annotation(*span, "here", true)
+        }
+
+        // ── Parser errors ─────────────────────────────────────────────────
+        BmError::UnexpectedToken { span, found, expected } => {
+            Diagnostic::error(format!("expected {}, found {}", expected, found))
+                .with_code("E0100").with_annotation(*span, "unexpected token", true)
+                .with_help("check your syntax against the BlackMagic specification")
+        }
+        BmError::UnexpectedEof { pos, expected } => {
+            let span = Span::new(*pos, *pos);
+            Diagnostic::error(format!("unexpected end of file, expected {}", expected))
+                .with_code("E0101").with_annotation(span, "here", true)
+        }
+        BmError::DuplicateModifier { span, modifier } => {
+            Diagnostic::error(format!("duplicate modifier '{}'", modifier))
+                .with_code("E0102").with_annotation(*span, "duplicate here", true)
+        }
+        BmError::InvalidAttribute { span, msg } => {
+            Diagnostic::error(msg.clone())
+                .with_code("E0103").with_annotation(*span, "invalid attribute", true)
+        }
+        BmError::MissingReturnType { span } => {
+            Diagnostic::error("missing return type annotation")
+                .with_code("E0104").with_annotation(*span, "add `-> Type` here", true)
+        }
+
+        // ── Module errors ─────────────────────────────────────────────────
+        BmError::ModuleNotFound { span, path } => {
+            Diagnostic::error(format!("module not found: {}", path))
+                .with_code("E0200").with_annotation(*span, "unresolved module", true)
+        }
+        BmError::CircularDependency { cycle } => {
+            Diagnostic::error(format!("circular dependency: {}", cycle.join(" → ")))
+                .with_code("E0201")
+        }
+        BmError::DuplicateExport { span, name, .. } => {
+            Diagnostic::error(format!("'{}' already exported", name))
+                .with_code("E0202").with_annotation(*span, "duplicate export", true)
+        }
+        BmError::UnresolvedImport { span, path } => {
+            Diagnostic::error(format!("unresolved import: {}", path))
+                .with_code("E0203").with_annotation(*span, "here", true)
+        }
+
+        // ── Type errors ───────────────────────────────────────────────────
+        BmError::TypeMismatch { span, expected, found } => {
+            Diagnostic::error(format!("expected {}, found {}", expected, found))
+                .with_code("E0300").with_annotation(*span, "type mismatch here", true)
+        }
+        BmError::UndefinedVariable { span, name } => {
+            Diagnostic::error(format!("undefined variable '{}'", name))
+                .with_code("E0301").with_annotation(*span, "not in scope", true)
+        }
+        BmError::UndefinedType { span, name } => {
+            Diagnostic::error(format!("undefined type '{}'", name))
+                .with_code("E0302").with_annotation(*span, "unknown type", true)
+        }
+        BmError::UndefinedField { span, ty, field } => {
+            Diagnostic::error(format!("type '{}' has no field '{}'", ty, field))
+                .with_code("E0303").with_annotation(*span, "no such field", true)
+        }
+        BmError::UndefinedMethod { span, ty, method } => {
+            Diagnostic::error(format!("type '{}' has no method '{}'", ty, method))
+                .with_code("E0304").with_annotation(*span, "no such method", true)
+        }
+        BmError::ArityMismatch { span, expected, found } => {
+            Diagnostic::error(format!("expected {} arguments, found {}", expected, found))
+                .with_code("E0305").with_annotation(*span, "argument count mismatch", true)
+        }
+        BmError::BorrowError { span, msg } => {
+            Diagnostic::error(msg.clone())
+                .with_code("E0400").with_annotation(*span, "borrow violation", true)
+                .with_note("BlackMagic enforces strict aliasing XOR mutation")
+        }
+        BmError::LinearTypeError { span, msg } => {
+            Diagnostic::error(msg.clone())
+                .with_code("E0401").with_annotation(*span, "linear type violation", true)
+                .with_note("linear types must be consumed exactly once")
+        }
+        BmError::EffectError { span, msg } => {
+            Diagnostic::error(msg.clone())
+                .with_code("E0500").with_annotation(*span, "effect mismatch", true)
+                .with_help("add the effect to the function signature: `fn f() !EffectName { ... }`")
+        }
+        BmError::RefinementViolation { span, msg } => {
+            Diagnostic::error(msg.clone())
+                .with_code("E0501").with_annotation(*span, "refinement violated", true)
+        }
+        BmError::NonExhaustiveMatch { span, missing } => {
+            Diagnostic::error(format!("non-exhaustive match — missing: {}", missing.join(", ")))
+                .with_code("E0502").with_annotation(*span, "missing cases", true)
+        }
+        BmError::ComptimeError { span, msg } => {
+            Diagnostic::error(msg.clone())
+                .with_code("E0600").with_annotation(*span, "comptime error", true)
+        }
+
+        // ── Codegen errors ────────────────────────────────────────────────
+        BmError::UnsupportedTarget { feature, target } => {
+            Diagnostic::error(format!("'{}' not supported on target '{}'", feature, target))
+                .with_code("E0700")
+        }
+        BmError::InternalError { msg } => {
+            Diagnostic::error(format!("internal compiler error: {}", msg))
+                .with_code("E9999")
+                .with_note("please report this at https://github.com/Cythru/BlackMagic.bm/issues")
+        }
+    }
+}
+
+// ─── Renderer ─────────────────────────────────────────────────────────────
+
+pub struct DiagRenderer<'src> {
+    src:      &'src str,
+    filename: String,
+    colour:   bool,
+}
+
+const RESET: &str = "\x1b[0m";
+const BOLD:  &str = "\x1b[1m";
+const DIM:   &str = "\x1b[2m";
+const BLUE:  &str = "\x1b[34m";
+const RED:   &str = "\x1b[31m";
+const CYAN:  &str = "\x1b[36m";
+
+impl<'src> DiagRenderer<'src> {
+    pub fn new(src: &'src str, filename: impl Into<String>, colour: bool) -> Self {
+        DiagRenderer { src, filename: filename.into(), colour }
+    }
+
+    pub fn render(&self, diag: &Diagnostic) -> String {
+        let mut out = String::new();
+
+        // ── Header line ───────────────────────────────────────────────────
+        let sev_ansi = if self.colour { diag.severity.ansi() } else { "" };
+        let bold     = if self.colour { BOLD } else { "" };
+        let reset    = if self.colour { RESET } else { "" };
+        let code_str = diag.code.as_deref().map(|c| format!("[{}]", c)).unwrap_or_default();
+
+        writeln!(out, "{}{}{}{}:{} {}{}",
+            bold, sev_ansi, diag.severity.label(), reset,
+            code_str,
+            bold, diag.message).unwrap();
+
+        // ── File / span pointer ───────────────────────────────────────────
+        if let Some(ann) = diag.annotations.first() {
+            let (line, col) = self.offset_to_line_col(ann.span.start.byte as usize);
+            let blue = if self.colour { BLUE } else { "" };
+            writeln!(out, "  {}{}-->{}  {}:{}:{}", blue, bold, reset, self.filename, line, col).unwrap();
+        }
+
+        // ── Source excerpts ───────────────────────────────────────────────
+        let mut sorted = diag.annotations.clone();
+        sorted.sort_by_key(|a| a.span.start.byte);
+
+        for ann in &sorted {
+            self.render_annotation(&mut out, ann, diag.severity);
+        }
+
+        // ── Notes ─────────────────────────────────────────────────────────
+        for note in &diag.notes {
+            let cyan = if self.colour { CYAN } else { "" };
+            writeln!(out, "  {}= note:{} {}", cyan, reset, note).unwrap();
+        }
+
+        // ── Help ──────────────────────────────────────────────────────────
+        if let Some(help) = &diag.help {
+            let cyan = if self.colour { CYAN } else { "" };
+            writeln!(out, "  {}= help:{} {}", cyan, reset, help).unwrap();
+        }
+
+        out
+    }
+
+    fn render_annotation(&self, out: &mut String, ann: &Annotation, sev: Severity) {
+        let lines: Vec<&str> = self.src.lines().collect();
+        let (start_line, start_col) = self.offset_to_line_col(ann.span.start.byte as usize);
+        let (end_line,   end_col)   = self.offset_to_line_col(ann.span.end.byte as usize);
+
+        let blue  = if self.colour { BLUE } else { "" };
+        let reset = if self.colour { RESET } else { "" };
+        let sev_ansi = if self.colour { sev.ansi() } else { "" };
+        let bold  = if self.colour { BOLD } else { "" };
+
+        let gutter_w = format!("{}", end_line).len();
+
+        writeln!(out, "  {}{}|{}", blue, bold, reset).unwrap();
+
+        for ln in start_line..=std::cmp::min(end_line, start_line + 3) {
+            if ln == 0 || ln > lines.len() { continue; }
+            let src_line = lines[ln - 1];
+            writeln!(out, "  {}{:>gutter_w$} |{}  {}",
+                blue, ln, reset, src_line, gutter_w = gutter_w).unwrap();
+
+            // Squiggles under the annotated column range
+            let sq_start = if ln == start_line { start_col.saturating_sub(1) } else { 0 };
+            let sq_end   = if ln == end_line   { end_col   } else { src_line.len() };
+            let sq_len   = sq_end.saturating_sub(sq_start).max(1);
+            let sq_char  = if ann.primary { '^' } else { '-' };
+            let spaces   = " ".repeat(sq_start + gutter_w + 6);
+            let squig    = sq_char.to_string().repeat(sq_len);
+            writeln!(out, "{}{}{}{}{} {}",
+                spaces, sev_ansi, bold, squig, reset, ann.label).unwrap();
+        }
+        writeln!(out, "  {}{}|{}", blue, bold, reset).unwrap();
+    }
+
+    fn offset_to_line_col(&self, offset: usize) -> (usize, usize) {
+        let safe = (offset as usize).min(self.src.len());
+        let before = &self.src[..safe];
+        let line = before.chars().filter(|&c| c == '\n').count() + 1;
+        let col  = before.rfind('\n').map(|p| safe - p - 1).unwrap_or(safe) + 1;
+        (line, col)
+    }
+}
+
+// ─── JSON renderer ────────────────────────────────────────────────────────
+
+pub fn render_json(diags: &[Diagnostic]) -> String {
+    let mut out = String::from("[\n");
+    for (i, d) in diags.iter().enumerate() {
+        let code = d.code.as_deref().unwrap_or("null");
+        let notes_json: Vec<String> = d.notes.iter().map(|n| format!("\"{}\"", n)).collect();
+        out.push_str(&format!(
+            "  {{\"severity\":\"{}\",\"code\":\"{}\",\"message\":\"{}\",\"notes\":[{}]}}{}",
+            d.severity.label(), code, d.message.replace('"', "\\\""),
+            notes_json.join(","),
+            if i + 1 < diags.len() { "," } else { "" }
+        ));
+        out.push('\n');
+    }
+    out.push(']');
+    out
+}

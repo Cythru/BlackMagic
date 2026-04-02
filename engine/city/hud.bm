@@ -1,0 +1,510 @@
+/// BlackMagic Engine — city/hud.bm
+///
+/// Oracle City — APEX TERMINAL interface (v3, complete redesign).
+///
+/// Layout (960×540):
+///
+///  ┌──────────────────────────────────────────────────────────────────────┐ 0
+///  │  [14,13]         ◆ ORACLE CITY ◆          090°  |  Midnight         │ 22
+///  ├──────────┬───────────────────────────────────────────────────────────┤
+///  │          │                                                           │
+///  │ NET WORTH│                                                           │
+///  │ $1.23b   │                                                           │
+///  │ ──────── │                  ⊙  reticle (480,270)                    │
+///  │ HCK LVL  │                  (two rings + ticks + dot)               │
+///  │ 432      │                                                           │
+///  │ ──────── │                                                           │
+///  │ CITY     │                                                           │
+///  │ Sector-12│   ┌────────────────────┐                                 │
+///  │ ──────── │   │  ┌──────────────┐  │  ← RADAR: bracket frame        │
+///  │ STATUS   │   │  │   map tiles  │  │     x=158, y=368, 160×150      │
+///  │ GANG  ●  │   │  │      ·       │  │                                │
+///  │ CORP  ●  │   │  └──────────────┘  │                                │
+///  │ 158px    │   └────────────────────┘                                 │
+///  ├──────────┴───────────────────────────────────────────────────────────┤ 520
+///  │  WASD Move · E Enter · Tab Map · T Theme · Esc                       │ 540
+///  └──────────────────────────────────────────────────────────────────────┘
+///
+///  Building panel (when inside) — bottom drawer, x=158-960, y=340-520:
+///  ┌──────────────────────── building color top border ──────────────────┐
+///  │ BUILDING NAME    │  content rows in two columns                     │
+///  │ [icon strip]     │  ─────────────────────────────────               │
+///  │                  │  stat: value      stat: value                    │
+///  └────────────────────────────────────────────────────────────── [Esc] ┘
+
+use engine::core::math::{ Vec2, Rect2, Color, cos, sin, PI };
+use engine::renderer::canvas::{ Canvas2D, BitmapFont };
+use engine::city::map::{ CityMap, BuildingKind };
+use engine::city::player::{ Player, PlayerStats, InteractState };
+use engine::city::theme::{ Theme };
+use bm::fmt::{ f64_to_str_2dp, u32_to_str, concat };
+
+// ─── Layout ───────────────────────────────────────────────────────────────────
+
+const HDR_H:    f32 =  22.0;   // header bar height
+const FTR_Y:    f32 = 520.0;   // footer top
+const FTR_H:    f32 =  20.0;   // footer height
+const SB_W:     f32 = 158.0;   // left sidebar width
+
+// RADAR (bottom-left of 3D area)
+const RAD_X:    f32 = 164.0;
+const RAD_Y:    f32 = 368.0;
+const RAD_W:    f32 = 156.0;
+const RAD_H:    f32 = 148.0;
+const RAD_TILE: f32 =   4.0;
+
+// Reticle (true canvas centre — matches raycaster projection)
+const RET_CX:   f32 = 480.0;
+const RET_CY:   f32 = 270.0;
+
+// Building panel drawer (bottom)
+const PNL_X:    f32 = 158.0;
+const PNL_Y:    f32 = 335.0;
+const PNL_W:    f32 = 802.0;
+const PNL_H:    f32 = 185.0;
+
+// ─── HUD ──────────────────────────────────────────────────────────────────────
+
+pub struct HUD {
+    pub show_minimap:  bool,
+    pub show_stats:    bool,
+    pub show_compass:  bool,
+}
+
+impl HUD {
+    pub fn new() -> HUD {
+        HUD { show_minimap: true, show_stats: true, show_compass: true }
+    }
+
+    pub fn draw(self: &HUD, canvas: &var Canvas2D, player: &Player,
+                map: &CityMap, font: &BitmapFont, theme: &Theme) {
+        // Always-on elements
+        draw_header(canvas, player, font, theme);
+        draw_footer(canvas, font, theme);
+        draw_sidebar(canvas, &player.stats, font, theme);
+        draw_reticle(canvas, theme);
+
+        if self.show_minimap {
+            draw_radar(canvas, player, map, theme, font);
+        }
+
+        // Interaction overlays
+        match &player.interact {
+            InteractState::NearBuilding { kind } => {
+                draw_interact_prompt(canvas, kind, font, theme);
+            }
+            InteractState::InsideBuilding { kind, scroll } => {
+                draw_building_panel(canvas, kind, &player.stats, font, theme);
+            }
+            InteractState::None => {}
+        }
+    }
+
+    /// Draw the HUD overlay for the full-screen map view:
+    /// header (MAP VIEW variant) + footer + left sidebar.
+    /// Call this after rendering the map tiles to the canvas.
+    pub fn draw_map_hud(self: &HUD, canvas: &var Canvas2D, player: &Player,
+                        font: &BitmapFont, theme: &Theme) {
+        draw_header_map(canvas, player, font, theme);
+        draw_footer(canvas, font, theme);
+        draw_sidebar(canvas, &player.stats, font, theme);
+    }
+}
+
+// ─── Header bar ───────────────────────────────────────────────────────────────
+
+fn draw_header(canvas: &var Canvas2D, player: &Player, font: &BitmapFont, theme: &Theme) {
+    // Background
+    canvas.draw_rect(Rect2::new(0.0, 0.0, 960.0, HDR_H), theme.hud_bar);
+    canvas.draw_line(Vec2::new(0.0, HDR_H), Vec2::new(960.0, HDR_H), theme.divider);
+
+    // Left: tile coordinates
+    let tx = player.camera.pos.x as u32;
+    let ty = player.camera.pos.y as u32;
+    let coord = concat("[", concat(u32_to_str(tx), concat(",", concat(u32_to_str(ty), "]"))));
+    canvas.draw_text(coord, Vec2::new(10.0, 5.0), theme.dim, font);
+
+    // Centre: title
+    canvas.draw_text("ORACLE CITY", Vec2::new(410.0, 5.0), theme.accent, font);
+
+    // Right: bearing + theme
+    let bearing = angle_to_bearing(player.camera.angle);
+    let bear_str = concat(u32_to_str(bearing), deg_sym());
+    canvas.draw_text(bear_str, Vec2::new(810.0, 5.0), theme.text, font);
+    canvas.draw_text(theme.name, Vec2::new(862.0, 5.0), theme.dim, font);
+
+    // Sidebar/header divider pip
+    canvas.draw_line(Vec2::new(SB_W, 0.0), Vec2::new(SB_W, HDR_H), theme.divider);
+}
+
+// Map-view variant of the header — shows "MAP VIEW" + hint instead of "ORACLE CITY".
+fn draw_header_map(canvas: &var Canvas2D, player: &Player, font: &BitmapFont, theme: &Theme) {
+    canvas.draw_rect(Rect2::new(0.0, 0.0, 960.0, HDR_H), theme.hud_bar);
+    canvas.draw_line(Vec2::new(0.0, HDR_H), Vec2::new(960.0, HDR_H), theme.divider);
+
+    // Left: tile coords
+    let tx = player.camera.pos.x as u32;
+    let ty = player.camera.pos.y as u32;
+    let coord = concat("[", concat(u32_to_str(tx), concat(",", concat(u32_to_str(ty), "]"))));
+    canvas.draw_text(coord, Vec2::new(10.0, 5.0), theme.dim, font);
+
+    // Centre: title
+    canvas.draw_text("MAP VIEW", Vec2::new(424.0, 5.0), theme.accent, font);
+
+    // Hint (right of sidebar divider)
+    canvas.draw_text("[Tab] 3D  [T] Theme", Vec2::new(SB_W + 10.0, 5.0), theme.dim, font);
+
+    // Right: bearing + theme name
+    let bearing = angle_to_bearing(player.camera.angle);
+    let bear_str = concat(u32_to_str(bearing), deg_sym());
+    canvas.draw_text(bear_str, Vec2::new(810.0, 5.0), theme.text, font);
+    canvas.draw_text(theme.name, Vec2::new(862.0, 5.0), theme.dim, font);
+
+    // Sidebar pip
+    canvas.draw_line(Vec2::new(SB_W, 0.0), Vec2::new(SB_W, HDR_H), theme.divider);
+}
+
+// ─── Footer bar ───────────────────────────────────────────────────────────────
+
+fn draw_footer(canvas: &var Canvas2D, font: &BitmapFont, theme: &Theme) {
+    canvas.draw_rect(Rect2::new(0.0, FTR_Y, 960.0, FTR_H), theme.hud_bar);
+    canvas.draw_line(Vec2::new(0.0, FTR_Y), Vec2::new(960.0, FTR_Y), theme.divider);
+    canvas.draw_text("WASD Move  ·  E Enter  ·  Tab Map  ·  T Theme  ·  Esc",
+                     Vec2::new(10.0, FTR_Y + 5.0), theme.dim, font);
+}
+
+// ─── Left sidebar — stats column ─────────────────────────────────────────────
+
+fn draw_sidebar(canvas: &var Canvas2D, stats: &PlayerStats, font: &BitmapFont, theme: &Theme) {
+    // Panel background + right border
+    canvas.draw_rect(Rect2::new(0.0, HDR_H, SB_W, FTR_Y - HDR_H), theme.panel_bg);
+    canvas.draw_line(Vec2::new(SB_W, HDR_H), Vec2::new(SB_W, FTR_Y), theme.accent.with_alpha(0.4));
+
+    let lx: f32 = 10.0;
+    var ly: f32 = HDR_H + 10.0;
+
+    // — Net Worth ——
+    canvas.draw_text("NET WORTH", Vec2::new(lx, ly), theme.dim, font);
+    ly += 14.0;
+    canvas.draw_text(format_money(stats.money), Vec2::new(lx, ly), theme.col_green, font);
+    ly += 14.0;
+    draw_sidebar_divider(canvas, ly, theme);
+    ly += 8.0;
+
+    // — Hack Level ——
+    canvas.draw_text("HCK LVL", Vec2::new(lx, ly), theme.dim, font);
+    ly += 14.0;
+    canvas.draw_text(u32_to_str(stats.hack_level), Vec2::new(lx, ly), theme.accent, font);
+    ly += 14.0;
+    draw_sidebar_divider(canvas, ly, theme);
+    ly += 8.0;
+
+    // — City ——
+    canvas.draw_text("CITY", Vec2::new(lx, ly), theme.dim, font);
+    ly += 14.0;
+    canvas.draw_text(stats.city, Vec2::new(lx, ly), theme.text, font);
+    ly += 14.0;
+    draw_sidebar_divider(canvas, ly, theme);
+    ly += 8.0;
+
+    // — Karma ——
+    canvas.draw_text("KARMA", Vec2::new(lx, ly), theme.dim, font);
+    ly += 14.0;
+    canvas.draw_text(f64_to_str_2dp(stats.karma), Vec2::new(lx, ly), theme.text, font);
+    ly += 14.0;
+    draw_sidebar_divider(canvas, ly, theme);
+    ly += 8.0;
+
+    // — Status badges ——
+    canvas.draw_text("STATUS", Vec2::new(lx, ly), theme.dim, font);
+    ly += 16.0;
+
+    // GANG dot
+    let gang_col = if stats.in_gang { theme.col_red } else { theme.dim };
+    canvas.draw_circle(Vec2::new(lx + 6.0, ly + 5.0), 5.0, gang_col);
+    canvas.draw_text("GANG", Vec2::new(lx + 16.0, ly), gang_col, font);
+    ly += 18.0;
+
+    // CORP dot
+    let corp_col = if stats.has_corp { theme.col_yellow } else { theme.dim };
+    canvas.draw_circle(Vec2::new(lx + 6.0, ly + 5.0), 5.0, corp_col);
+    canvas.draw_text("CORP", Vec2::new(lx + 16.0, ly), corp_col, font);
+}
+
+fn draw_sidebar_divider(canvas: &var Canvas2D, y: f32, theme: &Theme) {
+    canvas.draw_line(Vec2::new(6.0, y), Vec2::new(SB_W - 6.0, y), theme.divider);
+}
+
+// ─── Reticle — concentric ring sight ─────────────────────────────────────────
+
+fn draw_reticle(canvas: &var Canvas2D, theme: &Theme) {
+    let c = theme.text;
+
+    // Outer ring
+    canvas.draw_circle_outline(Vec2::new(RET_CX, RET_CY), 26.0, c.with_alpha(0.18));
+    // Inner ring
+    canvas.draw_circle_outline(Vec2::new(RET_CX, RET_CY), 12.0, c.with_alpha(0.42));
+
+    // 4 tick marks between the rings (r=15 to r=23)
+    let ti: f32 = 15.0;
+    let to: f32 = 23.0;
+
+    // North
+    canvas.draw_line(Vec2::new(RET_CX, RET_CY - to), Vec2::new(RET_CX, RET_CY - ti),
+                     c.with_alpha(0.65));
+    // South
+    canvas.draw_line(Vec2::new(RET_CX, RET_CY + ti), Vec2::new(RET_CX, RET_CY + to),
+                     c.with_alpha(0.65));
+    // East
+    canvas.draw_line(Vec2::new(RET_CX + ti, RET_CY), Vec2::new(RET_CX + to, RET_CY),
+                     c.with_alpha(0.65));
+    // West
+    canvas.draw_line(Vec2::new(RET_CX - to, RET_CY), Vec2::new(RET_CX - ti, RET_CY),
+                     c.with_alpha(0.65));
+
+    // Centre dot
+    canvas.draw_circle(Vec2::new(RET_CX, RET_CY), 2.2, theme.accent.with_alpha(0.95));
+}
+
+// ─── RADAR (minimap with bracket frame) ──────────────────────────────────────
+
+fn draw_radar(canvas: &var Canvas2D, player: &Player, map: &CityMap, theme: &Theme, font: &BitmapFont) {
+    // Background
+    canvas.draw_rect(Rect2::new(RAD_X, RAD_Y, RAD_W, RAD_H), theme.map_floor);
+
+    // Map tiles
+    let vtx = (RAD_W / RAD_TILE) as u32;
+    let vty = (RAD_H / RAD_TILE) as u32;
+    let cx_tile = player.camera.pos.x as i32;
+    let cy_tile = player.camera.pos.y as i32;
+    let hx = (vtx / 2) as i32;
+    let hy = (vty / 2) as i32;
+
+    var ty = 0i32;
+    while ty < vty as i32 {
+        var tx = 0i32;
+        while tx < vtx as i32 {
+            let mtx = cx_tile - hx + tx;
+            let mty = cy_tile - hy + ty;
+            if mtx >= 0 && mty >= 0 && mtx < map.width as i32 && mty < map.height as i32 {
+                let tile = map.tile_at(mtx as u32, mty as u32);
+                if tile.kind.is_solid() {
+                    let col = tile.kind.wall_color().darkened(0.3).blend(theme.accent, 0.10);
+                    canvas.draw_rect(
+                        Rect2::new(RAD_X + tx as f32 * RAD_TILE, RAD_Y + ty as f32 * RAD_TILE,
+                                   RAD_TILE - 0.5, RAD_TILE - 0.5),
+                        col,
+                    );
+                }
+            }
+            tx += 1;
+        }
+        ty += 1;
+    }
+
+    // Player dot at centre of radar
+    let ppx = RAD_X + hx as f32 * RAD_TILE + RAD_TILE * 0.5;
+    let ppy = RAD_Y + hy as f32 * RAD_TILE + RAD_TILE * 0.5;
+    canvas.draw_circle(Vec2::new(ppx, ppy), 3.5, theme.player_dot);
+
+    // Direction arrow
+    canvas.draw_line(
+        Vec2::new(ppx, ppy),
+        Vec2::new(ppx + cos(player.camera.angle) * 10.0,
+                  ppy + sin(player.camera.angle) * 10.0),
+        theme.player_dir,
+    );
+
+    // Bracket-corner frame (replaces boring full rect outline)
+    let bracket_len: f32 = 12.0;
+    let bc = theme.accent.with_alpha(0.75);
+    draw_brackets(canvas, RAD_X, RAD_Y, RAD_W, RAD_H, bracket_len, bc);
+
+    // "RADAR" label inside top-left
+    canvas.draw_text("RADAR", Vec2::new(RAD_X + 4.0, RAD_Y + 2.0), theme.dim, font);
+    // Bearing inside top-right
+    let bearing = angle_to_bearing(player.camera.angle);
+    canvas.draw_text(concat(u32_to_str(bearing), deg_sym()),
+                     Vec2::new(RAD_X + RAD_W - 32.0, RAD_Y + 2.0), theme.accent2, font);
+}
+
+fn draw_brackets(canvas: &var Canvas2D, x: f32, y: f32, w: f32, h: f32, len: f32, col: Color) {
+    // Top-left
+    canvas.draw_line(Vec2::new(x, y), Vec2::new(x + len, y), col);
+    canvas.draw_line(Vec2::new(x, y), Vec2::new(x, y + len), col);
+    // Top-right
+    canvas.draw_line(Vec2::new(x + w, y), Vec2::new(x + w - len, y), col);
+    canvas.draw_line(Vec2::new(x + w, y), Vec2::new(x + w, y + len), col);
+    // Bottom-left
+    canvas.draw_line(Vec2::new(x, y + h), Vec2::new(x + len, y + h), col);
+    canvas.draw_line(Vec2::new(x, y + h), Vec2::new(x, y + h - len), col);
+    // Bottom-right
+    canvas.draw_line(Vec2::new(x + w, y + h), Vec2::new(x + w - len, y + h), col);
+    canvas.draw_line(Vec2::new(x + w, y + h), Vec2::new(x + w, y + h - len), col);
+}
+
+// ─── Interact prompt — small notification at bottom of 3D area ───────────────
+
+fn draw_interact_prompt(canvas: &var Canvas2D, kind: &BuildingKind, font: &BitmapFont, theme: &Theme) {
+    let label = kind.label();
+    if label == "" { return; }
+
+    let pw: f32 = 320.0;
+    let ph: f32 = 30.0;
+    // Centre inside the 3D area (x=158–960), above radar area
+    let px = SB_W + (802.0 - pw) * 0.5;
+    let py: f32 = 440.0;
+    let build_col = kind.wall_color();
+
+    // Dim veil behind prompt
+    canvas.draw_rect(
+        Rect2::new(px - 8.0, py - 6.0, pw + 16.0, ph + 12.0),
+        Color { r:0.0, g:0.0, b:0.0, a:0.35 },
+    );
+    // Panel
+    canvas.draw_rect(Rect2::new(px, py, pw, ph), theme.panel_bg);
+    // Top accent line (building colour)
+    canvas.draw_line(Vec2::new(px, py), Vec2::new(px + pw, py), build_col.with_alpha(0.85));
+    // Left accent strip
+    canvas.draw_rect(Rect2::new(px, py, 3.0, ph), build_col.with_alpha(0.85));
+    // Border brackets
+    draw_brackets(canvas, px, py, pw, ph, 8.0, theme.border.with_alpha(0.5));
+    // Text
+    let prompt = concat("[E]  ", label);
+    canvas.draw_text(prompt, Vec2::new(px + 10.0, py + 9.0), theme.text, font);
+}
+
+// ─── Building panel — bottom drawer ──────────────────────────────────────────
+
+fn draw_building_panel(canvas: &var Canvas2D, kind: &BuildingKind,
+                        stats: &PlayerStats, font: &BitmapFont, theme: &Theme) {
+    let build_col = kind.wall_color();
+
+    // Dim the 3D view above the panel
+    canvas.draw_rect(
+        Rect2::new(SB_W, HDR_H, PNL_W, PNL_Y - HDR_H),
+        Color { r:0.0, g:0.0, b:0.0, a:0.28 },
+    );
+
+    // Panel body
+    canvas.draw_rect(Rect2::new(PNL_X, PNL_Y, PNL_W, PNL_H), theme.panel_bg);
+
+    // Top border (building colour, 2px)
+    canvas.draw_line(Vec2::new(PNL_X, PNL_Y), Vec2::new(PNL_X + PNL_W, PNL_Y),
+                     build_col.with_alpha(0.9));
+    canvas.draw_line(Vec2::new(PNL_X, PNL_Y + 1.0), Vec2::new(PNL_X + PNL_W, PNL_Y + 1.0),
+                     build_col.with_alpha(0.35));
+
+    // Left colour strip
+    canvas.draw_rect(Rect2::new(PNL_X, PNL_Y + 2.0, 3.0, PNL_H - 2.0),
+                     build_col.with_alpha(0.75));
+
+    // Left icon block + name
+    canvas.draw_rect(Rect2::new(PNL_X + 10.0, PNL_Y + 12.0, 16.0, 16.0),
+                     build_col.with_alpha(0.5));
+    canvas.draw_text(kind.label(), Vec2::new(PNL_X + 32.0, PNL_Y + 14.0), build_col, font);
+
+    // Vertical divider between left header and content
+    canvas.draw_line(Vec2::new(PNL_X + 10.0, PNL_Y + 36.0),
+                     Vec2::new(PNL_X + PNL_W - 10.0, PNL_Y + 36.0),
+                     theme.divider);
+
+    // Close hint
+    canvas.draw_text("[Esc]", Vec2::new(PNL_X + PNL_W - 46.0, PNL_Y + 14.0), theme.dim, font);
+
+    // Content (two columns)
+    let col1_x = PNL_X + 12.0;
+    let col2_x = PNL_X + PNL_W * 0.5;
+    var ly = PNL_Y + 46.0;
+    let line_h: f32 = 18.0;
+
+    match kind {
+        BuildingKind::StockExchange => {
+            draw_panel_row(canvas, col1_x, ly, "PORTFOLIO", format_money(stats.money * 0.3), theme.col_green, font, theme);
+            draw_panel_row(canvas, col2_x, ly, "SCRIPT", "FinalStonkinton.js", theme.dim, font, theme);
+            ly += line_h;
+            draw_panel_row(canvas, col1_x, ly, "BALANCE", format_money(stats.money), theme.text, font, theme);
+        }
+        BuildingKind::HackerDen => {
+            draw_panel_row(canvas, col1_x, ly, "HCK LVL", u32_to_str(stats.hack_level), theme.accent, font, theme);
+            draw_panel_row(canvas, col2_x, ly, "SCRIPT", "sysadmin.js", theme.dim, font, theme);
+            ly += line_h;
+            draw_panel_row(canvas, col1_x, ly, "STATUS", "TARGETS AVAILABLE", theme.col_green, font, theme);
+        }
+        BuildingKind::GangHQ => {
+            let status = if stats.in_gang { "ACTIVE" } else { "NO GANG" };
+            let status_col = if stats.in_gang { theme.col_green } else { theme.dim };
+            draw_panel_row(canvas, col1_x, ly, "GANG", status, status_col, font, theme);
+            draw_panel_row(canvas, col2_x, ly, "SCRIPT", "autogang.js", theme.dim, font, theme);
+            ly += line_h;
+            draw_panel_row(canvas, col1_x, ly, "KARMA", f64_to_str_2dp(stats.karma), theme.text, font, theme);
+        }
+        BuildingKind::CorpTower => {
+            let status = if stats.has_corp { "ACTIVE" } else { "REQUIRES $150B" };
+            let status_col = if stats.has_corp { theme.col_green } else { theme.dim };
+            draw_panel_row(canvas, col1_x, ly, "CORP", status, status_col, font, theme);
+            draw_panel_row(canvas, col2_x, ly, "SCRIPT", "autocorporation.js", theme.dim, font, theme);
+            ly += line_h;
+            draw_panel_row(canvas, col1_x, ly, "BALANCE", format_money(stats.money), theme.text, font, theme);
+        }
+        BuildingKind::AugClinic => {
+            draw_panel_row(canvas, col1_x, ly, "BALANCE", format_money(stats.money), theme.col_green, font, theme);
+            draw_panel_row(canvas, col2_x, ly, "NOTE", "SOFTCODE FIRST", theme.col_magenta, font, theme);
+        }
+        BuildingKind::Bank => {
+            draw_panel_row(canvas, col1_x, ly, "NET WORTH", format_money(stats.money), theme.col_green, font, theme);
+            draw_panel_row(canvas, col2_x, ly, "CITY", stats.city, theme.text, font, theme);
+        }
+        BuildingKind::TrainingCenter => {
+            draw_panel_row(canvas, col1_x, ly, "LOCATION", stats.city, theme.text, font, theme);
+            draw_panel_row(canvas, col2_x, ly, "NOTE", "TRAIN COMBAT STATS", theme.dim, font, theme);
+        }
+        BuildingKind::TravelAgency => {
+            draw_panel_row(canvas, col1_x, ly, "CURRENT", stats.city, theme.text, font, theme);
+            draw_panel_row(canvas, col2_x, ly, "TRAVEL", "CITY SELECT", theme.accent2, font, theme);
+        }
+        BuildingKind::Apartment => {
+            draw_panel_row(canvas, col1_x, ly, "RESIDENT", "CONFIRMED", theme.col_green, font, theme);
+            draw_panel_row(canvas, col2_x, ly, "CITY", stats.city, theme.text, font, theme);
+        }
+        _ => {
+            draw_panel_row(canvas, col1_x, ly, "STATUS", "EMPTY", theme.dim, font, theme);
+        }
+    }
+
+    // Bottom border brackets
+    draw_brackets(canvas, PNL_X, PNL_Y, PNL_W, PNL_H, 10.0, theme.border.with_alpha(0.4));
+}
+
+fn draw_panel_row(canvas: &var Canvas2D, x: f32, y: f32, lbl: str, val: str,
+                   val_col: Color, font: &BitmapFont, theme: &Theme) {
+    canvas.draw_text(lbl, Vec2::new(x, y), theme.dim, font);
+    canvas.draw_text(val, Vec2::new(x, y + 13.0), val_col, font);
+}
+
+// ─── Compat shim (called from old main.bm callers) ───────────────────────────
+
+pub fn draw_theme_chip(canvas: &var Canvas2D, theme_name: str, theme: &Theme, font: &BitmapFont) {
+    // Theme name is now in the header bar — this is a no-op.
+    _ = canvas; _ = theme_name; _ = theme; _ = font;
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+fn format_money(m: f64) -> str {
+    if m >= 1.0e12      { concat("$", concat(f64_to_str_2dp(m / 1.0e12), "t")) }
+    else if m >= 1.0e9  { concat("$", concat(f64_to_str_2dp(m / 1.0e9),  "b")) }
+    else if m >= 1.0e6  { concat("$", concat(f64_to_str_2dp(m / 1.0e6),  "m")) }
+    else if m >= 1.0e3  { concat("$", concat(f64_to_str_2dp(m / 1.0e3),  "k")) }
+    else                { concat("$", f64_to_str_2dp(m)) }
+}
+
+fn angle_to_bearing(angle: f32) -> u32 {
+    // angle=0 → East → 090°, angle=-PI/2 → North → 000°
+    let raw = angle * 57.2958 + 90.0 + 720.0;
+    let turns = (raw / 360.0) as u32;
+    let deg = raw - turns as f32 * 360.0;
+    deg as u32
+}
+
+fn deg_sym() -> str { "deg" }

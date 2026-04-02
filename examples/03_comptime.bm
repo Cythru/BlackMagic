@@ -1,0 +1,146 @@
+/// BlackMagic — Comptime Metaprogramming
+/// Shows: comptime functions, type generation, SIMD dispatch, reflection
+
+module comptime_demo
+
+use std::io::println
+use std::simd::*
+
+// ── Comptime constants ────────────────────────────────────────────────────────
+
+comptime fn pow(base: u64, exp: u64) -> u64 {
+    if exp == 0 { 1 }
+    else { base * pow(base, exp - 1) }
+}
+
+comptime fn fib(n: u64) -> u64 {
+    match n {
+        0 | 1 => n,
+        n => fib(n - 1) + fib(n - 2),
+    }
+}
+
+const PAGE_SIZE: u64    = pow(2, 12)   // = 4096
+const CACHE_LINE: u64   = pow(2, 6)    // = 64
+const FIB_20: u64       = fib(20)      // = 6765
+const FIB_30: u64       = fib(30)      // = 832040
+
+// ── Comptime type generation ─────────────────────────────────────────────────
+
+/// Generates a fixed-capacity ring buffer type for any T and capacity CAP.
+comptime fn make_ring_buffer(T: type, CAP: usize) -> type {
+    struct {
+        data:  [T; CAP],
+        read:  usize,
+        write: usize,
+        count: usize,
+
+        fn new() -> This {
+            This { data: [T::default(); CAP], read: 0, write: 0, count: 0 }
+        }
+
+        fn push(self: &mut This, val: T) -> bool {
+            if self.count == CAP { return false }
+            self.data[self.write] = val
+            self.write = (self.write + 1) % CAP
+            self.count += 1
+            true
+        }
+
+        fn pop(self: &mut This) -> ?T {
+            if self.count == 0 { return null }
+            let val = self.data[self.read]
+            self.read = (self.read + 1) % CAP
+            self.count -= 1
+            .Some(val)
+        }
+
+        fn len(self: &This) -> usize { self.count }
+        fn is_empty(self: &This) -> bool { self.count == 0 }
+        fn is_full(self: &This) -> bool  { self.count == CAP }
+    }
+}
+
+// Instantiate at compile time — zero cost, fully specialised
+const AudioBuffer = make_ring_buffer(f32, 4096)
+const EventQueue  = make_ring_buffer(u32, 256)
+const StringBuf   = make_ring_buffer(u8, 1024)
+
+// ── Comptime SIMD dispatch ────────────────────────────────────────────────────
+
+/// Dot product: automatically uses SIMD when available
+comptime fn dot<T>(a: &[T], b: &[T]) -> T {
+    assert!(a.len() == b.len(), "length mismatch")
+
+    if comptime T == f32 && comptime std::target::has_avx2() {
+        // 8-wide AVX2 path
+        dot_f32_avx2(a, b)
+    } else if comptime T == f32 && comptime std::target::has_sse4_1() {
+        // 4-wide SSE4.1 path
+        dot_f32_sse(a, b)
+    } else if comptime T == f64 && comptime std::target::has_avx2() {
+        // 4-wide AVX2 f64 path
+        dot_f64_avx2(a, b)
+    } else {
+        // Scalar fallback
+        var sum: T = T::zero()
+        for i in 0..a.len() {
+            sum = sum + a[i] * b[i]
+        }
+        sum
+    }
+}
+
+fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 { 0.0 } // stub
+fn dot_f32_sse(a: &[f32], b: &[f32])  -> f32 { 0.0 } // stub
+fn dot_f64_avx2(a: &[f64], b: &[f64]) -> f64 { 0.0 } // stub
+
+// ── Comptime reflection ───────────────────────────────────────────────────────
+
+struct Config {
+    host:    str,
+    port:    u16,
+    timeout: u32,
+    debug:   bool,
+}
+
+/// Generate a pretty-printer for any struct at compile time
+comptime fn make_display(T: type) -> fn(&T) -> str {
+    fn(val: &T) -> str {
+        var out = comptime T::name()
+        out = out + " {"
+        comptime for field in T::fields() {
+            out = out + "\n  " + field.name + ": "
+            out = out + format("{}", val.*field.name)
+        }
+        out + "\n}"
+    }
+}
+
+const display_config: fn(&Config) -> str = make_display(Config)
+
+// ── Main demonstration ────────────────────────────────────────────────────────
+
+fn main() !IO {
+    println("PAGE_SIZE  = {PAGE_SIZE}")   // 4096
+    println("CACHE_LINE = {CACHE_LINE}")  // 64
+    println("fib(20)    = {FIB_20}")      // 6765
+    println("fib(30)    = {FIB_30}")      // 832040
+
+    // Ring buffer — zero overhead, fully inlined
+    var audio: AudioBuffer::This = AudioBuffer::new()
+    audio.push(1.0)
+    audio.push(2.0)
+    audio.push(3.0)
+    println("audio buffer len = {audio.len()}")
+
+    // Dot product — comptime-dispatched to best SIMD path
+    let a = [1.0f32, 2.0, 3.0, 4.0]
+    let b = [5.0f32, 6.0, 7.0, 8.0]
+    let d = dot(&a, &b)
+    println("dot([1,2,3,4], [5,6,7,8]) = {d}")  // 70.0
+
+    // Reflection-generated display
+    let cfg = Config { host: "localhost", port: 8080, timeout: 30, debug: true }
+    println(display_config(&cfg))
+}

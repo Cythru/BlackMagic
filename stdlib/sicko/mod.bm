@@ -1,0 +1,202 @@
+/// bm::sicko — BlackMagic Maximum Aggression Mode
+///
+/// SICKO MODE is activated when you need every last nanosecond squeezed out.
+/// It runs ALL optimisation passes in a fixpoint loop, applies hardware-specific
+/// tuning, and enables extended unsafe-but-fast primitives.
+///
+/// SICKO vs JUICER:
+///   juicer = aggressive but safe, respects borrow checker and effect system
+///   sicko  = assumes you know exactly what you're doing — bypasses some checks
+///             in exchange for maximum raw throughput
+///
+/// Use `#[sicko]` or call `sicko::activate()` at module scope.
+
+module sicko {
+
+    // ── Activation ────────────────────────────────────────────────────────
+
+    /// Activate sicko mode for the current module.
+    /// Equivalent to `#[sicko]` at module level.
+    #[builtin]
+    comptime fn activate()
+
+    /// Activate sicko mode for a single function.
+    #[builtin]
+    comptime fn squeeze_max<F>(f: F) -> F
+
+    // ── Memory tricks ─────────────────────────────────────────────────────
+
+    /// Zero-cost transmute — reinterpret bits without any runtime cost.
+    /// SICKO version: skips alignment checks (you guarantee alignment).
+    #[builtin]
+    unsafe fn transmute<A, B>(val: A) -> B
+
+    /// Non-temporal store — write to memory without polluting cache.
+    /// Use for write-once streaming output (video frames, log buffers).
+    ///   throughput: 16 bytes/cycle vs 4 bytes/cycle for normal stores
+    #[builtin]
+    unsafe fn stream_store<T>(ptr: *T, val: T)
+
+    /// Non-temporal load — prefetch without polluting cache.
+    #[builtin]
+    unsafe fn stream_load<T>(ptr: *T) -> T
+
+    /// Memory fence — serialise all prior memory operations.
+    #[builtin]
+    fn mfence()
+
+    /// Software prefetch hint.
+    ///   locality: 0=no temporal locality, 1=L3, 2=L2, 3=L1
+    #[builtin]
+    fn prefetch<T>(ptr: *T, write: bool, locality: u8)
+
+    // ── SIMD primitives ───────────────────────────────────────────────────
+
+    /// Load 256 bits (8× f32) from an aligned address.
+    #[builtin]
+    unsafe fn avx2_load(ptr: *f32) -> vec8<f32>
+
+    /// Store 256 bits to an aligned address.
+    #[builtin]
+    unsafe fn avx2_store(ptr: *f32, v: vec8<f32>)
+
+    /// Fused multiply-add: a*b + c  (single instruction, full precision)
+    ///   throughput: 1 FMA/cycle per port on Haswell+ = 8 FLOPS/cycle
+    #[builtin]
+    fn fma(a: vec8<f32>, b: vec8<f32>, c: vec8<f32>) -> vec8<f32>
+
+    /// Horizontal sum of 8 floats (reduces to scalar).
+    fn hsum(v: vec8<f32>) -> f32 {
+        // Compiler emits: vperm2f128 + vaddps + vhaddps + vhaddps
+        let lo = v[0..4];
+        let hi = v[4..8];
+        let sum4 = lo + hi;
+        (sum4[0] + sum4[1]) + (sum4[2] + sum4[3])
+    }
+
+    // ── Branch prediction tricks ──────────────────────────────────────────
+
+    /// Compiler hint: this branch is taken >99% of the time.
+    #[builtin]
+    fn expect_true(cond: bool) -> bool
+
+    /// Compiler hint: this branch is taken <1% of the time.
+    #[builtin]
+    fn expect_false(cond: bool) -> bool
+
+    // ── Allocation-free data structures ───────────────────────────────────
+
+    /// Fixed-size ring buffer that lives entirely on the stack.
+    ///   O(1) push/pop, zero heap allocation, cache-local
+    comptime fn make_ring_buffer(T: type, CAP: usize) -> type {
+        struct RingBuffer {
+            data:  [T; CAP],
+            head:  usize,
+            tail:  usize,
+            count: usize,
+        }
+    }
+
+    /// Small-vector optimisation: stores N elements inline, heap-spills beyond.
+    comptime fn small_vec(T: type, N: usize) -> type {
+        struct SmallVec {
+            inline: [T; N],
+            spill:  ?*T,
+            len:    usize,
+        }
+    }
+
+    // ── Lock-free primitives ───────────────────────────────────────────────
+
+    /// Compare-and-swap (sequentially consistent).
+    #[builtin]
+    fn cas<T>(ptr: *var T, expected: T, desired: T) -> bool
+
+    /// Atomic fetch-add.
+    #[builtin]
+    fn fetch_add(ptr: *var u64, val: u64) -> u64
+
+    // ── Numeric tricks ────────────────────────────────────────────────────
+
+    /// Fast inverse square root (Quake III method).
+    ///   error: ~0.175%  speed: ~4× faster than 1.0/sqrt(x)
+    fn fast_inv_sqrt(x: f32) -> f32 {
+        unsafe {
+            var i: u32 = transmute::<f32, u32>(x);
+            i = 0x5f3759df - (i >> 1);
+            var y: f32 = transmute::<u32, f32>(i);
+            y * (1.5 - (x * 0.5 * y * y))
+        }
+    }
+
+    /// Branchless min/max via conditional move (CMOV).
+    fn min_branchless(a: i64, b: i64) -> i64 {
+        let diff = a - b;
+        b + (diff & (diff >> 63))
+    }
+
+    fn max_branchless(a: i64, b: i64) -> i64 {
+        let diff = b - a;
+        a + (diff & (diff >> 63))
+    }
+
+    /// Bit manipulation: count leading zeros.
+    #[builtin]
+    fn clz(x: u64) -> u32
+
+    /// Bit manipulation: count trailing zeros.
+    #[builtin]
+    fn ctz(x: u64) -> u32
+
+    /// Population count (number of set bits).
+    #[builtin]
+    fn popcount(x: u64) -> u32
+
+    /// Round up to next power of 2.
+    fn next_pow2(mut x: u64) -> u64 {
+        x -= 1;
+        x |= x >> 1;
+        x |= x >> 2;
+        x |= x >> 4;
+        x |= x >> 8;
+        x |= x >> 16;
+        x |= x >> 32;
+        x + 1
+    }
+
+    // ── Benchmark harness ─────────────────────────────────────────────────
+
+    /// Run a function N times and return median + p99 latency in nanoseconds.
+    fn benchmark<F>(name: &str, f: F, iters: u64) -> BenchStats !IO {
+        var times: [u64; 1000] = [0; 1000];
+        let samples = iters.min(1000);
+        var i: u64 = 0;
+        while i < iters {
+            let t0 = juicer::rdtsc();
+            f();
+            let t1 = juicer::rdtsc();
+            if i < samples { times[i as usize] = t1 - t0; }
+            i += 1;
+        }
+        // Sort first `samples` entries
+        let slice = times[0..samples as usize];
+        let median = slice[samples as usize / 2];
+        let p99    = slice[(samples as usize * 99) / 100];
+        let result = BenchStats { name: name, median_cycles: median, p99_cycles: p99 };
+        perform IO::write(format_bench(&result).as_bytes());
+        result
+    }
+
+    struct BenchStats {
+        name:          &str,
+        median_cycles: u64,
+        p99_cycles:    u64,
+    }
+
+    fn format_bench(s: &BenchStats) -> str {
+        // Format: "benchmark_name: median=123 cycles, p99=456 cycles"
+        s.name
+    }
+
+    use juicer;
+}

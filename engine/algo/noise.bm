@@ -1,0 +1,214 @@
+/// BlackMagic Engine — algo/noise.bm
+///
+/// Gradient noise and fractal Brownian motion.
+///
+///   perlin2       — Perlin noise, 2D, range ≈ [-1, 1]
+///   perlin3       — Perlin noise, 3D, range ≈ [-1, 1]
+///   fbm2          — Fractal Brownian Motion (2D), sums octaves of perlin2
+///   fbm3          — Fractal Brownian Motion (3D), sums octaves of perlin3
+///   value_noise2  — Value noise, 2D, range [0, 1]; cheaper than Perlin
+///   smoothstep    — Hermite fade (re-exported for shader-compat callers)
+///
+/// All functions are pure / stateless — no allocations.
+///
+/// Usage:
+///   let v = perlin2(x * 0.05, y * 0.05);         // ≈ [-1, 1]
+///   let h = fbm2(wx, wy, 6, 2.0, 0.5);           // 6 octaves, lacunarity 2, gain 0.5
+///
+/// Implementation notes:
+///   • Hash is a deterministic integer scramble; no lookup table needed.
+///   • Gradient set is the 8 corners of a unit square (2D) / 12 edges of a cube (3D).
+///   • fade() uses Ken Perlin's improved C2 quintic: 6t⁵ - 15t⁴ + 10t³
+
+// ─── Low-level helpers ────────────────────────────────────────────────────────
+
+/// Hermite quintic fade: 6t⁵ − 15t⁴ + 10t³  (C² continuity at integer grid)
+#[inline]
+fn fade(t: f32) -> f32 {
+    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+}
+
+#[inline]
+fn lerp(a: f32, b: f32, t: f32) -> f32 { a + t * (b - a) }
+
+/// Fast integer hash — bijective mix, no table.
+#[inline]
+fn hash1(n: i32) -> u32 {
+    let u = n as u32;
+    let a = u ^ (u << 13);
+    let b = a ^ (a >> 7);
+    let c = b ^ (b << 17);
+    c
+}
+
+#[inline]
+fn hash2(x: i32, y: i32) -> u32 {
+    hash1(x ^ hash1(y) as i32)
+}
+
+#[inline]
+fn hash3(x: i32, y: i32, z: i32) -> u32 {
+    hash1(x ^ hash1(y ^ hash1(z) as i32) as i32)
+}
+
+// ─── 2D gradient ──────────────────────────────────────────────────────────────
+
+/// 2D gradient: 8 unit vectors at 45° increments.
+#[inline]
+fn grad2(h: u32, dx: f32, dy: f32) -> f32 {
+    let sel = h & 7;
+    // 8 gradients: (±1,0) (0,±1) (±1,±1) normalised
+    if sel == 0 { return  dx + dy; }
+    if sel == 1 { return -dx + dy; }
+    if sel == 2 { return  dx - dy; }
+    if sel == 3 { return -dx - dy; }
+    if sel == 4 { return  dx; }
+    if sel == 5 { return -dx; }
+    if sel == 6 { return  dy; }
+    -dy
+}
+
+// ─── 3D gradient ──────────────────────────────────────────────────────────────
+
+/// 3D gradient: 12 midpoints of cube edges.
+#[inline]
+fn grad3(h: u32, dx: f32, dy: f32, dz: f32) -> f32 {
+    let sel = h & 15;
+    let u: f32 = if sel < 8 { dx } else { dy };
+    let v: f32 = if sel < 4 { dy } else if sel == 12 || sel == 14 { dx } else { dz };
+    let su: f32 = if (sel & 1) == 0 { u } else { -u };
+    let sv: f32 = if (sel & 2) == 0 { v } else { -v };
+    su + sv
+}
+
+// ─── Perlin 2D ────────────────────────────────────────────────────────────────
+
+/// Classic Perlin noise, 2D.  Result ∈ [-1, 1] (approx).
+/// Not band-limited; use fbm2 for terrain/texture use.
+#[sicko]
+pub fn perlin2(x: f32, y: f32) -> f32 {
+    let xi = x.floor() as i32;
+    let yi = y.floor() as i32;
+    let xf = x - xi as f32;
+    let yf = y - yi as f32;
+    let u  = fade(xf);
+    let v  = fade(yf);
+
+    let g00 = grad2(hash2(xi,     yi    ), xf,       yf      );
+    let g10 = grad2(hash2(xi + 1, yi    ), xf - 1.0, yf      );
+    let g01 = grad2(hash2(xi,     yi + 1), xf,       yf - 1.0);
+    let g11 = grad2(hash2(xi + 1, yi + 1), xf - 1.0, yf - 1.0);
+
+    lerp(lerp(g00, g10, u), lerp(g01, g11, u), v)
+}
+
+// ─── Perlin 3D ────────────────────────────────────────────────────────────────
+
+/// Classic Perlin noise, 3D.  Result ∈ [-1, 1] (approx).
+#[sicko]
+pub fn perlin3(x: f32, y: f32, z: f32) -> f32 {
+    let xi = x.floor() as i32;
+    let yi = y.floor() as i32;
+    let zi = z.floor() as i32;
+    let xf = x - xi as f32;
+    let yf = y - yi as f32;
+    let zf = z - zi as f32;
+    let u  = fade(xf);
+    let v  = fade(yf);
+    let w  = fade(zf);
+
+    let g000 = grad3(hash3(xi,     yi,     zi    ), xf,       yf,       zf      );
+    let g100 = grad3(hash3(xi + 1, yi,     zi    ), xf - 1.0, yf,       zf      );
+    let g010 = grad3(hash3(xi,     yi + 1, zi    ), xf,       yf - 1.0, zf      );
+    let g110 = grad3(hash3(xi + 1, yi + 1, zi    ), xf - 1.0, yf - 1.0, zf      );
+    let g001 = grad3(hash3(xi,     yi,     zi + 1), xf,       yf,       zf - 1.0);
+    let g101 = grad3(hash3(xi + 1, yi,     zi + 1), xf - 1.0, yf,       zf - 1.0);
+    let g011 = grad3(hash3(xi,     yi + 1, zi + 1), xf,       yf - 1.0, zf - 1.0);
+    let g111 = grad3(hash3(xi + 1, yi + 1, zi + 1), xf - 1.0, yf - 1.0, zf - 1.0);
+
+    let x00 = lerp(g000, g100, u);
+    let x10 = lerp(g010, g110, u);
+    let x01 = lerp(g001, g101, u);
+    let x11 = lerp(g011, g111, u);
+    lerp(lerp(x00, x10, v), lerp(x01, x11, v), w)
+}
+
+// ─── FBM 2D ───────────────────────────────────────────────────────────────────
+
+/// Fractal Brownian Motion, 2D.
+///   octaves    — number of noise layers (4-8 is typical for terrain)
+///   lacunarity — frequency multiplier per octave (typically 2.0)
+///   gain       — amplitude multiplier per octave (typically 0.5)
+/// Returns unnormalised sum; divide by `max_amplitude` if you need [0,1]:
+///   max_amplitude = (1 - gain^octaves) / (1 - gain)
+#[sicko]
+pub fn fbm2(x: f32, y: f32, octaves: u32, lacunarity: f32, gain: f32) -> f32 {
+    var value:     f32 = 0.0;
+    var amplitude: f32 = 0.5;
+    var freq_x:    f32 = x;
+    var freq_y:    f32 = y;
+    var i: u32 = 0;
+    while i < octaves {
+        value += perlin2(freq_x, freq_y) * amplitude;
+        freq_x    *= lacunarity;
+        freq_y    *= lacunarity;
+        amplitude *= gain;
+        i += 1;
+    }
+    value
+}
+
+// ─── FBM 3D ───────────────────────────────────────────────────────────────────
+
+/// Fractal Brownian Motion, 3D.
+#[sicko]
+pub fn fbm3(x: f32, y: f32, z: f32, octaves: u32, lacunarity: f32, gain: f32) -> f32 {
+    var value:     f32 = 0.0;
+    var amplitude: f32 = 0.5;
+    var freq_x:    f32 = x;
+    var freq_y:    f32 = y;
+    var freq_z:    f32 = z;
+    var i: u32 = 0;
+    while i < octaves {
+        value += perlin3(freq_x, freq_y, freq_z) * amplitude;
+        freq_x    *= lacunarity;
+        freq_y    *= lacunarity;
+        freq_z    *= lacunarity;
+        amplitude *= gain;
+        i += 1;
+    }
+    value
+}
+
+// ─── Value noise 2D ──────────────────────────────────────────────────────────
+
+/// Value noise, 2D.  Cheaper than Perlin; smoother than white noise.
+/// Result ∈ [0, 1].
+#[sicko]
+pub fn value_noise2(x: f32, y: f32) -> f32 {
+    let xi = x.floor() as i32;
+    let yi = y.floor() as i32;
+    let xf = x - xi as f32;
+    let yf = y - yi as f32;
+    let u  = fade(xf);
+    let v  = fade(yf);
+
+    // Random values in [0,1] at each corner
+    let v00 = (hash2(xi,     yi    ) & 0xFFFF) as f32 / 65535.0;
+    let v10 = (hash2(xi + 1, yi    ) & 0xFFFF) as f32 / 65535.0;
+    let v01 = (hash2(xi,     yi + 1) & 0xFFFF) as f32 / 65535.0;
+    let v11 = (hash2(xi + 1, yi + 1) & 0xFFFF) as f32 / 65535.0;
+
+    lerp(lerp(v00, v10, u), lerp(v01, v11, u), v)
+}
+
+// ─── smoothstep ───────────────────────────────────────────────────────────────
+
+/// Smooth Hermite interpolation [0, 1].  Clamped.
+#[inline]
+pub fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    var t = (x - edge0) / (edge1 - edge0);
+    if t < 0.0 { t = 0.0; }
+    if t > 1.0 { t = 1.0; }
+    t * t * (3.0 - 2.0 * t)
+}
