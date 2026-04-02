@@ -5,7 +5,7 @@
 
 [build]
 # Use all available cores
-jobs = 0
+jobs = 4
 
 # ── Android / Termux (aarch64-linux-android) ─────────────────────────────────
 # When building natively on Termux the host IS the target — these flags
